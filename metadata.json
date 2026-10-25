@@ -1,0 +1,10 @@
+{
+  "name": "Remix Room Style Visualizer",
+  "description": "Redesign your room in clicks using Gemini Nano Banana 2 Lite. Swipe through styled interior design variations of your own space.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

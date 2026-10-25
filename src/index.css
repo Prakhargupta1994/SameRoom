@@ -1,0 +1,6 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Syncopate:wght@400;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-syncopate: "Syncopate", sans-serif;
+}
