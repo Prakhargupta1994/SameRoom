@@ -1,97 +1,63 @@
-# Space Lift
+# SameRoom
 
-**Space Lift turns a few phone photos of any room — or the outside of your house — into photorealistic redesigns in seconds, grounded in real interior-design rules rather than guesswork.** Snap 3–4 angles (or a short video pan), pick a style, and get back a restyled, true-to-your-space render you can compare, refine by talking to it, and share.
+**SameRoom turns a photo of your actual room into a photorealistic redesign of that same room, powered by Meta's Muse Image and Muse Spark, and it is built to hold up under real traffic.** Your walls, windows and layout stay; everything else can change, just by asking.
 
-Here is why it works:
-
-- **It redesigns real spaces, interiors *and* exteriors, in 14 designer styles.** Living rooms, bedrooms, kitchens, offices, house facades, and gardens are all supported, across styles from Japandi and Mid-Century Modern to Modern Farmhouse and Mediterranean — each render keeps your actual walls, windows, and layout instead of inventing a stock room.
-- **Every design is backed by real data, not vibes.** Each style ships a full 60-30-10 colour formula with genuine paint codes (Farrow & Ball, Benjamin Moore, Sherwin-Williams), target lighting temperatures in Kelvin, material lists, and ergonomic clearances — plus a bed-fit calculator that checks whether a single/double/queen/king actually fits the room.
-- **Results stay consistent across angles and can be refined by conversation.** A master-render-plus-reference system keeps furniture, palette, and materials identical from one camera angle to the next, and a running "Tweak with Gemini" chat lets you layer changes ("paint the wall terracotta", then "add a plant") without losing earlier edits.
-- **It is fast and keeps your key private.** Photos are downscaled in the browser and only the one image each request needs is uploaded (roughly a 10× smaller payload), while every AI call runs through a small backend so your Gemini API key is never exposed to the browser.
+- **It redesigns your real space.** Muse Image edits your own photo in place, so the result is unmistakably your room, not a stock render.
+- **It understands the room.** Muse Spark reads the photo, estimates its size and checks which bed sizes actually fit, returning structured data the app displays.
+- **It protects itself and its budget.** Per-device rate limits, a server-wide daily cap on Meta calls, a bounded request queue and a render cache keep it fast, fair and affordable.
+- **It fails clearly, never silently.** Every Meta call has a time limit, one automatic retry and a plain-English error, with a self-test and live stats built in.
 
 ---
 
-## Features
+## How Meta's models are used
 
-- Multi-angle capture (camera, photo upload, or video-pan frame extraction)
-- 14 interior/exterior design styles, each with a 60-30-10 palette, paint codes, lighting spec, and clearance rules
-- Five makeover modes: Paint Only, Architectural Restyle, Declutter & Polish, Virtual Staging, Custom
-- Exterior / facade & garden modes (body-trim-accent repaint, landscaping, curb appeal)
-- Before/after split comparison and cross-angle consistency
-- Conversational "Tweak with Gemini" (voice or text) with memory of previous tweaks
-- Room-dimension & bed-fit estimator (with an honest "estimate only" note)
-- Time-of-day lighting simulator (golden hour / noon / blue hour)
-- Tap-to-tag furniture → shopping list with cost/dimensions, status tracking, and copy/export
-- Cinematic video walkthrough (Gemini Omni) and a contained 3D parallax viewer
-- One-tap **Share** (native share sheet with the image; downloads as fallback)
-- Consolidated PDF design dossier export
-- Favorites saved locally
+| Model | Endpoint | Role |
+|---|---|---|
+| **Muse Image** (`muse-image-1.0`) | `POST /v1/images/edits` | Restyles the user's own photo (paint, furniture, decor, lighting) |
+| **Muse Image** | `POST /v1/images/generations` | Fallback when no photo is supplied |
+| **Muse Spark** (`muse-spark-1.3`) | `POST /v1/chat/completions` (text + image) | Reads the room photo: dimensions, ceiling height, bed fit, placement (JSON) |
 
-## Tech stack
+All calls use Meta Model API's OpenAI-compatible endpoints with plain `fetch` from the Express backend. The API key never reaches the browser.
 
-| Layer | Technology |
+## Production readiness
+
+| Concern | What SameRoom does |
 |---|---|
-| Frontend | React + TypeScript, Vite, Tailwind CSS, Framer Motion, lucide-react, jsPDF |
-| Backend | Node.js + Express |
-| AI | Google Gemini (image model for restyle, text model for analysis/prompts, Omni for video) via `@google/genai` |
-| Storage | Browser `localStorage` (favorites, tags) — no database |
+| Secrets | Meta key lives only on the server (environment secret) |
+| Resilience | Per-call time limit, one retry on 429 / 5xx / network errors, readable errors, browser-side time limit with a Try again button |
+| Abuse and cost | Per-device sliding-window limits for renders, analyses and credit-spending health checks; server-wide daily cap on Meta calls |
+| Efficiency | Photos downscaled in the browser before upload; one image per request; LRU render cache (repeat views are instant and free); identical in-flight requests share one Meta call; room analyses cached |
+| Backpressure | At most N image calls run at once, a bounded queue waits behind them, and anything beyond gets a clear "busy, try again" (503) instead of piling up |
+| Observability | Timing log per Meta call, `/api/stats` live counters, `/api/meta-health` self-test with a built-in test photo |
 
-## Architecture (in one picture)
+### Scaling past one server
+The web tier is stateless except for the in-memory limits and caches, so the path to many users is:
+1. Move rate-limit counters, the daily budget and the caches to **Redis**, then run several instances behind a **load balancer**.
+2. Move renders to a **job queue with workers** (start, then poll) so web requests return immediately and long renders can't hit gateway timeouts.
+3. Store finished renders in **object storage behind a CDN** instead of returning base64.
+4. Tie quotas to **user accounts** instead of devices.
 
-```
-Browser (App.tsx)  ──HTTPS──►  Express server (server.ts)  ──►  Google Gemini
-  UI + state                     hides API key,                  image / text /
-  photo capture                  calls Gemini,                   video models
-  shrinks images                 streams video
-        ▲                              │
-        └──────── rendered image ──────┘
-```
+Cost grows with the number of Meta calls, so every cache hit is a call that isn't paid for twice. `/api/stats` shows the hit rate live.
 
-The **frontend** owns everything you see and do; the **backend** is a thin, secure bridge to Gemini (it keeps the API key server-side, makes the AI calls, and streams generated video). The browser never talks to Gemini directly.
+## Configuration
 
-## Getting started
+| Variable | Default | Purpose |
+|---|---|---|
+| `META_API_KEY` | (required) | Meta Model API key |
+| `META_BASE_URL` | `https://api.meta.ai/v1` | API base URL |
+| `META_TEXT_MODEL` / `META_IMAGE_MODEL` | `muse-spark-1.3` / `muse-image-1.0` | Model names |
+| `META_TIMEOUT_MS` | `150000` | Time limit per Meta call |
+| `META_MAX_CONCURRENCY` / `META_MAX_QUEUE` | `4` / `16` | Image calls at once / allowed to wait |
+| `RATE_WINDOW_SECONDS` | `600` | Rate-limit window |
+| `RATE_LIMIT_RENDERS` / `RATE_LIMIT_ANALYSES` / `RATE_LIMIT_HEALTH` | `40` / `20` / `10` | Per-device limits per window |
+| `DAILY_META_CALL_CAP` | `800` | Server-wide Meta calls per UTC day |
+| `CACHE_MAX_MB` | `64` | Render cache size |
 
-Prerequisites: Node.js 18+ and a Google Gemini API key.
+## Run it
 
-```bash
-# 1. install
-npm install
+Requires Node.js 18+ and a Meta Model API key. `npm install`, set `META_API_KEY`, then `npm run dev` (script names may differ slightly in `package.json`). Check `/api/meta-health?image=1&edit=1` and `/api/stats` once it's running.
 
-# 2. add your key (create a .env file in the project root)
-echo "GEMINI_API_KEY=your_key_here" > .env
 
-# 3. run (Vite + Express together)
-npm run dev
-```
 
-Then open the app at `http://localhost:3000`.
-
-> Built originally in Google AI Studio, where the key is injected automatically. Running it anywhere else just needs the `GEMINI_API_KEY` environment variable. Script names (`dev`, `build`, `start`) may differ slightly in your `package.json` — adjust to match.
-
-## Project structure
-
-```
-.
-├── App.tsx        # Frontend: all UI, screens, state, and the design/style data
-├── server.ts      # Backend: Express API that talks to Gemini and streams video
-├── SKILL.md       # A reusable interior + exterior design "advisor" prompt (for Gemini / AI Studio)
-├── README.md
-└── .gitignore
-```
-
-## How it works (the pipeline)
-
-1. You add 3–4 photos; the browser **downscales** each to ~1024px to keep uploads small.
-2. You choose a room/exterior type, a style, and a makeover mode.
-3. The app sends **one** target photo + a text prompt (built from the style's palette/materials) to `POST /api/generate`.
-4. The server calls the Gemini image model and returns a restyled photo, which the app caches per style/angle.
-5. Extra angles reuse a **reference render** of the first ("master") angle so the design stays consistent.
-6. You can compare before/after, tweak by chatting, tag furniture, estimate dimensions, generate a video tour, share, or export a PDF.
-
-## Roadmap ideas
-
-- Dedicated exterior style presets (villa, stucco, brick-and-black, regional contemporary)
-- Fast mode (skip the reference image for parallel, lower-latency angles)
-- Persist renders (IndexedDB) for instant reloads
-- Shareable design links (requires saving renders server-side)
-
+## Roadmap
+SAM 3.1 surface masks for per-surface edits · reference-image consistency across angles · Redis-backed limits and cache · render job queue with workers.
