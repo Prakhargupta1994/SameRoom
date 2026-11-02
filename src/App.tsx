@@ -1025,6 +1025,31 @@ const STYLE_CONFIGS: StyleConfig[] = [
   }
 ];
 
+// Calls the server with a hard time limit so a stuck request can never leave the UI waiting forever.
+async function fetchWithTimeout(url: string, init: RequestInit, ms = 180000): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } catch (e: any) {
+    if (e?.name === "AbortError") throw new Error(`The server did not answer within ${Math.round(ms / 1000)} seconds.`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Reads a reply as JSON without throwing, so error pages from a gateway become readable messages.
+async function readJsonSafe(res: Response): Promise<any> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    const gw = res.status === 502 || res.status === 504 ? " (usually a gateway timeout)" : "";
+    return { error: `The server replied with HTTP ${res.status} and a page instead of data${gw}.` };
+  }
+}
+
 declare global {
   interface Window {
     aistudio?: {
@@ -1035,7 +1060,11 @@ declare global {
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>("welcome");
-  const [hasLinkedKey, setHasLinkedKey] = useState(false);
+  const [hasLinkedKey, setHasLinkedKey] = useState(true);
+  const [loadingSeconds, setLoadingSeconds] = useState(0);
+  // Why a generation failed (key = `${styleId}-${viewKey}`), so the UI can explain instead of hanging forever
+  const [genErrors, setGenErrors] = useState<Record<string, string>>({});
+  const [isSharing, setIsSharing] = useState(false);
 
   // Multi-photo room angles state
   const [photos, setPhotos] = useState<RoomAnglePhoto[]>([]);
@@ -1269,6 +1298,67 @@ export default function App() {
   const [cameraFov, setCameraFov] = useState(75); // 50 to 95 degrees
   const isDragging3D = useRef(false);
   const lastMousePos = useRef({ x: 0, y: 0 });
+  const orbit3dRef = useRef<HTMLDivElement>(null);
+  const yawRef = useRef(0);
+  const pitchRef = useRef(0);
+  const applyOrbitTransform = () => {
+    const el = orbit3dRef.current;
+    if (el) {
+      el.style.transform = `rotateY(${yawRef.current * 0.15}deg) rotateX(${pitchRef.current * 0.15}deg) scale(${1.08 + (95 - cameraFov) * 0.004})`;
+    }
+  };
+  useEffect(() => {
+    if (threeDViewerOpen) {
+      yawRef.current = cameraYaw;
+      pitchRef.current = cameraPitch;
+    }
+  }, [threeDViewerOpen]);
+
+  const dataUrlToFile = async (dataUrl: string, filename: string): Promise<File> => {
+    const res = await fetch(dataUrl);
+    const blob = await res.blob();
+    return new File([blob], filename, { type: blob.type || "image/png" });
+  };
+
+  const handleShareCurrent = async () => {
+    const activeList = filteredStyles.length > 0 ? filteredStyles : STYLE_CONFIGS;
+    const currentStyle = activeList[currentIndex] || activeList[0];
+    const imgUrl = styleImages[currentStyle?.id]?.[activeView];
+    if (!imgUrl) return;
+
+    setIsSharing(true);
+    const safeName = (currentStyle?.name || "room").replace(/\s+/g, "-");
+    const filename = `SpaceLift-${safeName}.png`;
+    const title = `${currentStyle?.name || "My room"} design`;
+    const text = `${currentStyle?.name || ""} — ${currentStyle?.subtitle || ""}. Designed with Space Lift.`;
+    try {
+      let file: File | null = null;
+      try {
+        file = await dataUrlToFile(imgUrl, filename);
+      } catch {
+        file = null;
+      }
+      const nav: any = navigator;
+      if (file && nav.canShare && nav.canShare({ files: [file] })) {
+        await nav.share({ files: [file], title, text });
+      } else if (nav.share) {
+        await nav.share({ title, text });
+      } else {
+        const a = document.createElement("a");
+        a.href = imgUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      }
+    } catch (e: any) {
+      if (e && e.name !== "AbortError") {
+        console.error("Share failed", e);
+      }
+    } finally {
+      setIsSharing(false);
+    }
+  };
 
   // Carousel Navigation
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -2204,6 +2294,67 @@ Space Lift Architectural Engine.
     }
   };
 
+  // 1-Click Demo for Exterior & Courtyard Architecture
+  const handleExteriorDemoUpload = async () => {
+    try {
+      const response = await fetch("/test-image2.jpeg");
+      const blob = await response.blob();
+      const base64 = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.readAsDataURL(blob);
+      });
+
+      const img = new Image();
+      img.onload = async () => {
+        const w = img.naturalWidth || img.width;
+        const h = img.naturalHeight || img.height;
+
+        const c1 = document.createElement("canvas");
+        c1.width = w;
+        c1.height = h;
+        const ctx1 = c1.getContext("2d")!;
+        ctx1.drawImage(img, 0, 0);
+        const a1 = c1.toDataURL("image/jpeg", 0.9);
+
+        const c2 = document.createElement("canvas");
+        c2.width = Math.floor(w * 0.78);
+        c2.height = h;
+        const ctx2 = c2.getContext("2d")!;
+        ctx2.drawImage(img, 0, 0, Math.floor(w * 0.78), h, 0, 0, c2.width, c2.height);
+        const a2 = c2.toDataURL("image/jpeg", 0.9);
+
+        const c3 = document.createElement("canvas");
+        c3.width = Math.floor(w * 0.78);
+        c3.height = h;
+        const ctx3 = c3.getContext("2d")!;
+        ctx3.drawImage(img, Math.floor(w * 0.22), 0, Math.floor(w * 0.78), h, 0, 0, c3.width, c3.height);
+        const a3 = c3.toDataURL("image/jpeg", 0.9);
+
+        const [s1, s2, s3] = await Promise.all([shrinkImage(a1), shrinkImage(a2), shrinkImage(a3)]);
+        setPhotos([
+          { id: "demo-ext-1", url: s1, label: "Angle 1", tag: "Courtyard & Facade View" },
+          { id: "demo-ext-2", url: s2, label: "Angle 2", tag: "Daylight Verandah Angle" },
+          { id: "demo-ext-3", url: s3, label: "Angle 3", tag: "Garden & Water Basin Nook" }
+        ]);
+
+        // Preconfigure for Indian Courtyard / Exterior
+        setRoomType("indian courtyard");
+        setSpaceCategoryFilter("exterior");
+        setCustomDirectives("Add a traditional carved teakwood swing (jhula) with brass hanging chains, terracotta jali privacy screens, and a brass urli fountain with floating flowers.");
+
+        // Automatically point to the Indian Haveli Courtyard style
+        const haveliIdx = STYLE_CONFIGS.findIndex((s) => s.id === "indian_haveli_courtyard");
+        if (haveliIdx >= 0) {
+          setCurrentIndex(haveliIdx);
+        }
+      };
+      img.src = base64;
+    } catch (e) {
+      console.error("Demo exterior load error", e);
+    }
+  };
+
   // Build targeted prompt based on user's styling mode & room type
   const buildPromptForTarget = (style: StyleConfig) => {
     const isExterior =
@@ -2270,6 +2421,13 @@ Space Lift Architectural Engine.
     if (!force && (styleImages[style.id]?.[viewKey] || fetchingRef.current.has(fetchKey))) return;
 
     fetchingRef.current.add(fetchKey);
+    const errKey = `${style.id}-${viewKey}`;
+    setGenErrors((prev) => {
+      if (!(errKey in prev)) return prev;
+      const n = { ...prev };
+      delete n[errKey];
+      return n;
+    });
 
     // The "master" view renders first and becomes the reference every other angle matches.
     const masterKey = currentPhotos.length > 1 ? "overview" : "angle-0";
@@ -2294,7 +2452,7 @@ Space Lift Architectural Engine.
         : undefined;
       const promptText = buildPromptForTarget(style);
 
-      const res = await fetch("/api/generate", {
+      const res = await fetchWithTimeout("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2317,7 +2475,7 @@ Space Lift Architectural Engine.
         })
       });
 
-      const data = await res.json();
+      const data = await readJsonSafe(res);
       if (res.ok && data.imageUrl) {
         setStyleImages((prev) => ({
           ...prev,
@@ -2330,9 +2488,15 @@ Space Lift Architectural Engine.
         if (isMaster || !masterRenderRef.current[style.id]) {
           masterRenderRef.current[style.id] = data.imageUrl;
         }
+      } else {
+        setGenErrors((prev) => ({
+          ...prev,
+          [errKey]: data?.error || `The server answered with an error (HTTP ${res.status}).`
+        }));
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error(`Failed to fetch ${viewKey} for ${style.name}`, e);
+      setGenErrors((prev) => ({ ...prev, [errKey]: e?.message || "Could not reach the server." }));
     } finally {
       fetchingRef.current.delete(fetchKey);
       setIsRegenerating(false);
@@ -2355,14 +2519,21 @@ Space Lift Architectural Engine.
     fetchStyleImage(currentIndex, activeView as any, photos, true);
   };
 
-  // Apply Gemini "Tweak & Talk" directives — now a running conversation with memory.
-  const handleApplyGeminiTweak = async () => {
+  // Apply Meta AI "Tweak & Talk" directives — now a running conversation with memory.
+  const handleApplyMetaTweak = async () => {
     setIsRegenerating(true);
     const activeList = filteredStyles.length > 0 ? filteredStyles : STYLE_CONFIGS;
     const style = activeList[currentIndex] || activeList[0];
     if (!style) return;
 
     const threadKey = `${style.id}-${activeView}`;
+    setGenErrors((prev) => {
+      if (!(threadKey in prev)) return prev;
+      const n = { ...prev };
+      delete n[threadKey];
+      return n;
+    });
+
     const masterKey = photos.length > 1 ? "overview" : "angle-0";
     const isMasterView = activeView === masterKey;
 
@@ -2396,7 +2567,7 @@ Space Lift Architectural Engine.
         ? await shrinkImage(masterRenderRef.current[style.id], 896, 0.8)
         : undefined;
 
-      const res = await fetch("/api/generate", {
+      const res = await fetchWithTimeout("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2418,7 +2589,7 @@ Space Lift Architectural Engine.
         })
       });
 
-      const data = await res.json();
+      const data = await readJsonSafe(res);
       if (res.ok && data.imageUrl) {
         setStyleImages((prev) => ({
           ...prev,
@@ -2443,9 +2614,15 @@ Space Lift Architectural Engine.
         setTweakPrompt("");
         setSelectedTweakColor("");
         setSelectedBedSize("None");
+      } else {
+        setGenErrors((prev) => ({
+          ...prev,
+          [threadKey]: data?.error || `The server answered with an error (HTTP ${res.status}).`
+        }));
       }
-    } catch (e) {
-      console.error("Failed to apply Gemini tweak", e);
+    } catch (e: any) {
+      console.error("Failed to apply Meta tweak", e);
+      setGenErrors((prev) => ({ ...prev, [threadKey]: e?.message || "Could not reach the server." }));
     } finally {
       setIsRegenerating(false);
     }
@@ -2542,30 +2719,17 @@ Space Lift Architectural Engine.
 
   // When proceeding to countdown/cards, start pre-fetching initial view
   const startGenerating = () => {
+    setLoadingSeconds(0);
     setScreen("countdown");
     setCountdown(2);
-    setActiveView(photos.length > 1 ? "overview" : "angle-0");
-    // Pre-fetch style 0 master first so angles have a reference to match.
-    fetchStyleImage(0, photos.length > 1 ? "overview" : "angle-0");
-    if (photos.length > 1) {
-      fetchStyleImage(0, "angle-0");
-    }
+    const initialView = photos.length > 1 ? "overview" : "angle-0";
+    setActiveView(initialView);
+    // Pre-fetch ONLY the active initial view to avoid concurrent queue congestion
+    fetchStyleImage(0, initialView);
   };
 
-  const handleStartGenerating = async (e?: React.MouseEvent) => {
+  const handleStartGenerating = (e?: React.MouseEvent) => {
     if (e) e.preventDefault();
-
-    if (!hasLinkedKey) {
-      if (window.aistudio && window.aistudio.openSelectKey) {
-        const success = await window.aistudio.openSelectKey();
-        if (success !== false) {
-          setHasLinkedKey(true);
-          startGenerating();
-        }
-        return;
-      }
-    }
-
     startGenerating();
   };
 
@@ -2589,6 +2753,19 @@ Space Lift Architectural Engine.
     return () => clearTimeout(timer);
   }, [screen, countdown, styleImages, photos, filteredStyles]);
 
+  // Loading seconds counter for real-time user feedback
+  useEffect(() => {
+    let interval: any;
+    if (screen === "loading") {
+      interval = setInterval(() => {
+        setLoadingSeconds((s) => s + 1);
+      }, 1000);
+    } else {
+      setLoadingSeconds(0);
+    }
+    return () => clearInterval(interval);
+  }, [screen]);
+
   useEffect(() => {
     if (screen === "loading") {
       const activeList = filteredStyles.length > 0 ? filteredStyles : STYLE_CONFIGS;
@@ -2600,16 +2777,23 @@ Space Lift Architectural Engine.
     }
   }, [screen, styleImages, photos, filteredStyles]);
 
-  // Eagerly pre-fetch next style (master view) when index advances
+  // Pre-fetch next style only after current card has finished rendering, debounced
   useEffect(() => {
     if (screen === "cards") {
       const activeList = filteredStyles.length > 0 ? filteredStyles : STYLE_CONFIGS;
-      const nextIdx = currentIndex + 1;
-      if (nextIdx < activeList.length) {
-        fetchStyleImage(nextIdx, photos.length > 1 ? "overview" : "angle-0");
+      const currentStyle = activeList[currentIndex];
+      const masterKey = photos.length > 1 ? "overview" : "angle-0";
+      if (currentStyle && styleImages[currentStyle.id]?.[masterKey]) {
+        const nextIdx = currentIndex + 1;
+        if (nextIdx < activeList.length) {
+          const timer = setTimeout(() => {
+            fetchStyleImage(nextIdx, masterKey as any);
+          }, 1200);
+          return () => clearTimeout(timer);
+        }
       }
     }
-  }, [screen, currentIndex, photos, filteredStyles]);
+  }, [screen, currentIndex, photos, filteredStyles, styleImages]);
 
   // When activeView changes on current card, fetch if missing.
   // Render the MASTER view first so non-master angles have a reference to match.
@@ -2762,17 +2946,39 @@ Space Lift Architectural Engine.
                 <p className="text-[#222222]/70 text-xs sm:text-sm mb-4 text-center max-w-sm px-2 leading-relaxed">
                   Capture <strong>3 to 4 photos</strong> or upload a <strong>room video pan</strong>. Style your actual room while strictly preserving its walls, windows, and layout.
                 </p>
-                <div className="flex items-center justify-center gap-2 mb-4">
-                  <button
-                    type="button"
-                    onClick={() => setStyleCatalogOpen(true)}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-white/90 hover:bg-white text-xs font-semibold text-amber-950 border border-amber-600/30 shadow-2xs hover:shadow-xs transition-all cursor-pointer"
-                  >
-                    <Palette className="w-3.5 h-3.5 text-amber-600" />
-                    <span>Explore All 15 Architectural Styles</span>
-                    <span className="text-[10px] bg-amber-100 text-amber-900 font-mono px-1.5 py-0.2 rounded-full font-bold">15</span>
-                    <ChevronRight className="w-3 h-3 text-amber-600" />
-                  </button>
+                {/* Release Announcement Card for New Features */}
+                <div className="w-full mb-4 p-3.5 sm:p-4 rounded-2xl bg-gradient-to-br from-[#2D241E] via-[#1E1C1A] to-[#121110] text-white shadow-md border border-amber-500/30 text-left">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="inline-flex items-center gap-1.5 text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-400/30 px-2 py-0.5 rounded-full uppercase tracking-wider">
+                      <Sparkles className="w-3 h-3 text-amber-400 animate-pulse" />
+                      NEW: EXTERIORS & ZIP PACKS
+                    </span>
+                    <span className="text-[10px] text-amber-200/80 font-mono font-medium">20 Styles Available</span>
+                  </div>
+                  <h3 className="text-sm font-bold text-white mb-1 tracking-tight">
+                    🌳 Exterior & Garden Architecture · 🪔 Indian Havelis · 📦 ZIP Design Pack
+                  </h3>
+                  <p className="text-[11px] text-stone-300 mb-3 leading-relaxed">
+                    Now redesign outdoor landscapes, Indian courtyards (Aangan), and verandahs (Thinnai) with terracotta jalis and teak jhula swings. Download full 4-angle ZIP packs with 60-30-10 palette JSON and shopping lists.
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={handleExteriorDemoUpload}
+                      className="inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold shadow-xs transition-all cursor-pointer active:scale-[0.98]"
+                    >
+                      <span>🌳 Try Indian Courtyard Demo</span>
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setStyleCatalogOpen(true)}
+                      className="inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-stone-100 text-xs font-medium border border-white/15 transition-all cursor-pointer active:scale-[0.98]"
+                    >
+                      <Palette className="w-3.5 h-3.5 text-amber-300" />
+                      <span>Browse All 20 Styles</span>
+                    </button>
+                  </div>
                 </div>
               </>
             ) : (
@@ -3107,15 +3313,24 @@ Space Lift Architectural Engine.
                 </div>
               )}
 
-              {/* Demo 3-angle Room Preset */}
+              {/* 1-Click Demo Presets for Instant Testing */}
               {photos.length === 0 && (
-                <button
-                  onClick={handleDemoUpload}
-                  className="w-full rounded-2xl border border-amber-600/30 bg-amber-50/90 hover:bg-amber-100/90 text-amber-950 py-3 text-xs sm:text-sm font-medium shadow-2xs active:scale-[0.98] transition-all flex items-center justify-center gap-2"
-                >
-                  <Sparkles className="w-4 h-4 text-amber-600" />
-                  Try 3-Angle Demo Room (Instant 1-Click)
-                </button>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full">
+                  <button
+                    onClick={handleExteriorDemoUpload}
+                    className="w-full rounded-2xl border border-emerald-600/40 bg-emerald-50/90 hover:bg-emerald-100/90 text-emerald-950 py-3 px-3 text-xs font-semibold shadow-2xs active:scale-[0.98] transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <span className="text-sm">🌳</span>
+                    <span>Try Indian Courtyard (1-Click)</span>
+                  </button>
+                  <button
+                    onClick={handleDemoUpload}
+                    className="w-full rounded-2xl border border-amber-600/30 bg-amber-50/90 hover:bg-amber-100/90 text-amber-950 py-3 px-3 text-xs font-medium shadow-2xs active:scale-[0.98] transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <span className="text-sm">🛋️</span>
+                    <span>Try Interior Living Room (1-Click)</span>
+                  </button>
+                </div>
               )}
 
               {/* Main Submit Button */}
@@ -3252,28 +3467,67 @@ Space Lift Architectural Engine.
           </motion.div>
         )}
 
-        {/* ===================== LOADING SKELETON ===================== */}
+        {/* ===================== LOADING SCREEN ===================== */}
         {screen === "loading" && (
           <div className="flex-1 flex items-center justify-center p-4">
             <motion.div
-              initial={{ opacity: 0, y: 20 }}
+              initial={{ opacity: 0, y: 16 }}
               animate={{ opacity: 1, y: 0 }}
-              className="w-full max-w-sm bg-white rounded-[32px] p-4 flex flex-col relative overflow-hidden shadow-sm min-h-[520px]"
+              className="w-full max-w-sm bg-white rounded-[32px] p-6 flex flex-col items-center text-center relative overflow-hidden shadow-md border border-[#222222]/10"
             >
-              <div className="flex items-center justify-between mb-3 px-1">
-                <div className="h-5 w-28 bg-[#EAE9E4]/80 rounded-full animate-pulse" />
-                <div className="h-5 w-16 bg-[#EAE9E4]/80 rounded-full animate-pulse" />
+              {/* Animated Icon & Badge */}
+              <div className="relative mb-4 mt-2">
+                <div className="w-16 h-16 rounded-2xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-2xl animate-pulse">
+                  🛋️
+                </div>
+                <div className="absolute -bottom-1.5 -right-1.5 bg-[#222222] text-amber-400 p-1.5 rounded-full shadow-xs">
+                  <Sparkles className="w-3.5 h-3.5 animate-spin" style={{ animationDuration: "3s" }} />
+                </div>
               </div>
-              <div className="w-full aspect-[4/3] rounded-2xl bg-[#EAE9E4]/60 animate-pulse flex-none" />
-              <div className="mt-6 space-y-2.5 px-2 flex-1">
-                <div className="h-6 w-3/4 bg-[#EAE9E4]/60 rounded-full animate-pulse" />
-                <div className="h-5 w-5/6 bg-[#EAE9E4]/60 rounded-full animate-pulse" />
-                <div className="h-5 w-1/2 bg-[#EAE9E4]/60 rounded-full animate-pulse" />
+
+              {/* Title & Style Details */}
+              <h2 className="text-base font-bold text-[#222222] tracking-tight mb-1">
+                Restyling with Meta Muse Image
+              </h2>
+              <p className="text-xs text-[#222222]/70 max-w-xs mb-4 leading-relaxed">
+                Applying <strong>{STYLING_MODES.find((m) => m.id === stylingMode)?.label || "Architectural Restyle"}</strong> to your {roomType} while preserving walls, windows, and exact geometry.
+              </p>
+
+              {/* Real-time Timer & Status */}
+              <div className="w-full bg-[#F6F5F2] rounded-2xl p-3 mb-4 border border-[#222222]/5 flex flex-col gap-1.5">
+                <div className="flex items-center justify-between text-[11px] font-semibold text-[#222222]/80">
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping" />
+                    Generating architectural photo
+                  </span>
+                  <span className="font-mono text-amber-700 bg-amber-100/80 px-2 py-0.5 rounded-md">
+                    {loadingSeconds}s
+                  </span>
+                </div>
+                <div className="w-full bg-[#EAE9E4] h-1.5 rounded-full overflow-hidden">
+                  <motion.div
+                    className="h-full bg-gradient-to-r from-amber-500 to-amber-600 rounded-full"
+                    animate={{ width: ["15%", "85%", "95%"] }}
+                    transition={{ duration: 12, ease: "easeInOut" }}
+                  />
+                </div>
+                <span className="text-[10px] text-[#222222]/50 text-left">
+                  {loadingSeconds < 5
+                    ? "Submitting photo & palette to Meta API..."
+                    : loadingSeconds < 12
+                    ? "Diffusion restyling · preserving room perspective..."
+                    : "Finalizing architectural render & lighting..."}
+                </span>
               </div>
-              <div className="mt-auto flex items-center justify-between px-2 pt-4">
-                <div className="h-8 w-24 bg-[#EAE9E4]/80 rounded-full animate-pulse" />
-                <div className="h-8 w-24 bg-[#EAE9E4]/80 rounded-full animate-pulse" />
-              </div>
+
+              {/* Skip / View Cards Action */}
+              <button
+                type="button"
+                onClick={() => setScreen("cards")}
+                className="text-xs text-[#222222]/60 hover:text-[#222222] font-medium py-1.5 px-3 rounded-full hover:bg-[#F6F5F2] transition-colors cursor-pointer"
+              >
+                Skip directly to cards →
+              </button>
             </motion.div>
           </div>
         )}
@@ -4273,15 +4527,32 @@ Space Lift Architectural Engine.
                               )}
                             </div>
                           ) : (
-                            <div className="flex flex-col items-center justify-center gap-2 p-4 text-center">
-                              <Loader2 className="w-6 h-6 animate-spin text-[#222222]/60" />
-                              <span className="text-xs font-medium text-[#222222]/80">
-                                Restyling {activeView === "overview" ? "Whole Room Overview" : activeView} in {currentStyle.name}...
-                              </span>
-                              <span className="text-[10px] text-[#222222]/50">
-                                {STYLING_MODES.find(m => m.id === stylingMode)?.badge} · Preserving room shell · Matching other angles
-                              </span>
-                            </div>
+                            (() => {
+                              const cardErr = genErrors[`${currentStyle.id}-${activeView}`];
+                              return cardErr ? (
+                                <div className="flex flex-col items-center justify-center gap-2 p-4 text-center max-w-xs">
+                                  <span className="text-xs font-bold text-red-700">This view could not be generated</span>
+                                  <span className="text-[11px] text-[#222222]/70 leading-snug break-words">{cardErr}</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => fetchStyleImage(currentIndex, activeView as any, photos, true)}
+                                    className="mt-1 text-[11px] font-semibold bg-[#222222] text-white px-3 py-1.5 rounded-lg cursor-pointer hover:bg-black transition-colors"
+                                  >
+                                    Try again
+                                  </button>
+                                </div>
+                              ) : (
+                                <div className="flex flex-col items-center justify-center gap-2 p-4 text-center">
+                                  <Loader2 className="w-6 h-6 animate-spin text-[#222222]/60" />
+                                  <span className="text-xs font-medium text-[#222222]/80">
+                                    Restyling {activeView === "overview" ? "Whole Room Overview" : activeView} in {currentStyle.name}...
+                                  </span>
+                                  <span className="text-[10px] text-[#222222]/50">
+                                    {STYLING_MODES.find(m => m.id === stylingMode)?.badge} · Preserving room shell · Matching other angles
+                                  </span>
+                                </div>
+                              );
+                            })()
                           )}
 
                           {/* Floating Comparison & View Badge */}
@@ -4350,22 +4621,40 @@ Space Lift Architectural Engine.
                           </p>
                         </div>
 
-                        {/* Save to Favorites Bookmark Button */}
-                        <button
-                          onClick={() => toggleFavorite(currentStyle.id)}
-                          className={`p-2 rounded-full border transition-all ${
-                            savedStyleIds.includes(currentStyle.id)
-                              ? "bg-amber-100 border-amber-300 text-amber-800"
-                              : "bg-white border-[#222222]/10 text-[#222222]/60 hover:text-[#222222]"
-                          }`}
-                          title="Save to My Favorites"
-                        >
-                          <Bookmark
-                            className={`w-4 h-4 ${
-                              savedStyleIds.includes(currentStyle.id) ? "fill-amber-600 text-amber-600" : ""
+                        {/* Share + Save actions */}
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={handleShareCurrent}
+                            disabled={!currentRenderedImage || isSharing}
+                            className="p-2 rounded-full border bg-white border-[#222222]/10 text-[#222222]/60 hover:text-[#222222] transition-all disabled:opacity-40 cursor-pointer shadow-2xs"
+                            title="Share this room design"
+                          >
+                            {isSharing ? (
+                              <Loader2 className="w-4 h-4 animate-spin text-amber-600" />
+                            ) : (
+                              <Share2 className="w-4 h-4 text-[#222222]" />
+                            )}
+                          </button>
+
+                          {/* Save to Favorites Bookmark Button */}
+                          <button
+                            type="button"
+                            onClick={() => toggleFavorite(currentStyle.id)}
+                            className={`p-2 rounded-full border transition-all cursor-pointer shadow-2xs ${
+                              savedStyleIds.includes(currentStyle.id)
+                                ? "bg-amber-100 border-amber-300 text-amber-800"
+                                : "bg-white border-[#222222]/10 text-[#222222]/60 hover:text-[#222222]"
                             }`}
-                          />
-                        </button>
+                            title="Save to My Favorites"
+                          >
+                            <Bookmark
+                              className={`w-4 h-4 ${
+                                savedStyleIds.includes(currentStyle.id) ? "fill-amber-600 text-amber-600" : ""
+                              }`}
+                            />
+                          </button>
+                        </div>
                       </div>
 
                       <p className="text-xs text-[#222222]/70 leading-relaxed mb-3">
@@ -4483,10 +4772,10 @@ Space Lift Architectural Engine.
                         <button
                           onClick={() => setTweakModalOpen(true)}
                           className="flex-1 py-2.5 px-3 rounded-2xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold flex items-center justify-center gap-1.5 shadow-sm active:scale-95 transition-all"
-                          title="Tweak colors, bed size, or tell Gemini what to change"
+                          title="Tweak colors, bed size, or tell Meta AI what to change"
                         >
                           <Sparkles className="w-3.5 h-3.5 text-white" />
-                          <span>✨ Tweak with Gemini</span>
+                          <span>✨ Tweak with Meta AI</span>
                         </button>
 
                         <button
@@ -5097,9 +5386,12 @@ Space Lift Architectural Engine.
               <div className="flex items-center gap-2">
                 <button
                   onClick={() => {
+                    yawRef.current = 0;
+                    pitchRef.current = 0;
                     setCameraYaw(0);
                     setCameraPitch(0);
                     setCameraFov(75);
+                    applyOrbitTransform();
                   }}
                   className="text-[11px] text-white/70 hover:text-white px-2.5 py-1 rounded-full bg-white/10 backdrop-blur-md"
                 >
@@ -5126,15 +5418,23 @@ Space Lift Architectural Engine.
                 const dx = e.clientX - lastMousePos.current.x;
                 const dy = e.clientY - lastMousePos.current.y;
                 lastMousePos.current = { x: e.clientX, y: e.clientY };
-
-                setCameraYaw((y) => {
-                  const next = y + dx * 0.4;
-                  return next > 180 ? next - 360 : next < -180 ? next + 360 : next;
-                });
-                setCameraPitch((p) => Math.max(-30, Math.min(30, p - dy * 0.3)));
+                let next = yawRef.current + dx * 0.4;
+                next = next > 180 ? next - 360 : next < -180 ? next + 360 : next;
+                yawRef.current = next;
+                pitchRef.current = Math.max(-30, Math.min(30, pitchRef.current - dy * 0.3));
+                applyOrbitTransform(); // direct DOM write — no React re-render
               }}
               onMouseUp={() => {
+                if (!isDragging3D.current) return;
                 isDragging3D.current = false;
+                setCameraYaw(yawRef.current);
+                setCameraPitch(pitchRef.current);
+              }}
+              onMouseLeave={() => {
+                if (!isDragging3D.current) return;
+                isDragging3D.current = false;
+                setCameraYaw(yawRef.current);
+                setCameraPitch(pitchRef.current);
               }}
               onTouchStart={(e) => {
                 if (e.touches[0]) {
@@ -5147,15 +5447,17 @@ Space Lift Architectural Engine.
                 const dx = e.touches[0].clientX - lastMousePos.current.x;
                 const dy = e.touches[0].clientY - lastMousePos.current.y;
                 lastMousePos.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
-
-                setCameraYaw((y) => {
-                  const next = y + dx * 0.45;
-                  return next > 180 ? next - 360 : next < -180 ? next + 360 : next;
-                });
-                setCameraPitch((p) => Math.max(-30, Math.min(30, p - dy * 0.35)));
+                let next = yawRef.current + dx * 0.45;
+                next = next > 180 ? next - 360 : next < -180 ? next + 360 : next;
+                yawRef.current = next;
+                pitchRef.current = Math.max(-30, Math.min(30, pitchRef.current - dy * 0.35));
+                applyOrbitTransform(); // direct DOM write — no React re-render
               }}
               onTouchEnd={() => {
+                if (!isDragging3D.current) return;
                 isDragging3D.current = false;
+                setCameraYaw(yawRef.current);
+                setCameraPitch(pitchRef.current);
               }}
             >
               {/* Perspective 3D Room Box Container */}
@@ -5168,11 +5470,10 @@ Space Lift Architectural Engine.
               >
                 {currentRenderedImage ? (
                   <div
+                    ref={orbit3dRef}
                     className="w-full h-full relative rounded-2xl overflow-hidden shadow-2xl transition-transform duration-75 ease-out"
                     style={{
-                      // Contained parallax tilt: multiplied down so it reads as an intentional
-                      // 3D-feel card rather than a flat photo flipping to show its edge.
-                      transform: `rotateY(${cameraYaw * 0.15}deg) rotateX(${cameraPitch * 0.15}deg) scale(${1.08 + (95 - cameraFov) * 0.004})`,
+                      transform: `rotateY(${yawRef.current * 0.15}deg) rotateX(${pitchRef.current * 0.15}deg) scale(${1.08 + (95 - cameraFov) * 0.004})`,
                       transformStyle: "preserve-3d",
                       backfaceVisibility: "hidden"
                     }}
@@ -5201,7 +5502,7 @@ Space Lift Architectural Engine.
 
               {/* Interaction Hint */}
               <div className="absolute bottom-6 bg-black/60 backdrop-blur-md px-3.5 py-1.5 rounded-full text-white/80 text-[11px] font-medium pointer-events-none border border-white/10">
-                Drag to tilt the view · For a true walkthrough, use the Video Tour
+                Drag to tilt the view
               </div>
             </div>
 
@@ -5212,8 +5513,11 @@ Space Lift Architectural Engine.
                 <button
                   onClick={() => {
                     setActiveView("overview");
+                    yawRef.current = 0;
+                    pitchRef.current = 0;
                     setCameraYaw(0);
                     setCameraPitch(0);
+                    applyOrbitTransform();
                   }}
                   className={`px-3 py-1.5 rounded-xl text-xs font-semibold backdrop-blur-md transition-all ${
                     activeView === "overview"
@@ -5232,8 +5536,11 @@ Space Lift Architectural Engine.
                       key={p.id}
                       onClick={() => {
                         setActiveView(key);
+                        yawRef.current = cardinalYaw;
+                        pitchRef.current = 0;
                         setCameraYaw(cardinalYaw);
                         setCameraPitch(0);
+                        applyOrbitTransform();
                       }}
                       className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium backdrop-blur-md transition-all ${
                         activeView === key
@@ -5469,7 +5776,7 @@ Space Lift Architectural Engine.
                   </div>
                   <div>
                     <h3 className="font-bold text-base text-[#222222]">
-                      Tweak this Room with Gemini
+                      Tweak this Room with Meta AI
                     </h3>
                     <p className="text-xs text-[#222222]/60">
                       A running conversation — each request builds on the last
@@ -5526,7 +5833,7 @@ Space Lift Architectural Engine.
                         ? "bg-red-500 text-white animate-pulse"
                         : "bg-amber-500 text-white hover:bg-amber-600"
                     }`}
-                    title={isListeningVoice ? "Stop recording" : "Speak your directives to Gemini"}
+                    title={isListeningVoice ? "Stop recording" : "Speak your directives to Meta AI"}
                   >
                     {isListeningVoice ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
                   </button>
@@ -5584,7 +5891,7 @@ Space Lift Architectural Engine.
               {/* Text Area for Directives */}
               <div>
                 <label className="text-[10px] font-bold text-[#222222]/70 uppercase tracking-wider block mb-1">
-                  {(chatThreads[threadKey]?.length ?? 0) > 0 ? "Add another change" : "Specific Instructions for Gemini"}
+                  {(chatThreads[threadKey]?.length ?? 0) > 0 ? "Add another change" : "Specific Instructions for Meta AI"}
                 </label>
                 <textarea
                   value={tweakPrompt}
@@ -5722,7 +6029,7 @@ Space Lift Architectural Engine.
 
               {/* Submit Tweak */}
               <button
-                onClick={handleApplyGeminiTweak}
+                onClick={handleApplyMetaTweak}
                 disabled={isRegenerating}
                 className="w-full py-3 bg-[#222222] text-white rounded-2xl font-semibold text-xs shadow-md hover:bg-black active:scale-98 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
               >
@@ -5784,7 +6091,7 @@ Space Lift Architectural Engine.
                 <div className="py-12 flex flex-col items-center justify-center text-center gap-2">
                   <Loader2 className="w-8 h-8 animate-spin text-indigo-600" />
                   <span className="text-xs font-semibold text-[#222222]">
-                    Gemini Spatial Vision analyzing vanishing lines & door reference anchors...
+                    Meta Muse Spatial Vision analyzing vanishing lines & door reference anchors...
                   </span>
                   <span className="text-[10px] text-[#222222]/50">
                     Calibrating 0.5x ultra-wide optical barrel distortion

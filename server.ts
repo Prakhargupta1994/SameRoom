@@ -1,26 +1,393 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
+import zlib from "zlib";
+import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI } from "@google/genai";
 
-let aiClient: GoogleGenAI | null = null;
-function getAiClient() {
-  if (!aiClient) {
-    if (!process.env.GEMINI_API_KEY) {
-      throw new Error('GEMINI_API_KEY environment variable is missing');
-    }
-    aiClient = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
-      httpOptions: {
-        timeout: 300000, // 5 minutes
-        headers: {
-          'User-Agent': 'aistudio-build',
-        }
-      },
-    });
+// ===================== META MODEL API HELPERS (plain fetch, no SDK) =====================
+// Meta Model API is OpenAI-compatible. Base URL + model names can be overridden with env vars.
+const META_BASE = (process.env.META_BASE_URL || "https://api.meta.ai/v1").replace(/\/$/, "");
+const META_TEXT_MODEL = process.env.META_TEXT_MODEL || "muse-spark-1.3"; // reasoning + photo analysis
+const META_IMAGE_MODEL = process.env.META_IMAGE_MODEL || "muse-image-1.0"; // restyle + generate
+// Only sent if you set it (valid sizes not confirmed yet). Example: META_IMAGE_SIZE=1024x1024
+const META_IMAGE_SIZE = process.env.META_IMAGE_SIZE || "";
+
+// ---- errors that say what actually went wrong -------------------------------------------
+class MetaError extends Error {
+  status: number;
+  hint: string;
+  detail: string;
+  constructor(status: number, hint: string, detail: string) {
+    super(detail ? `${hint} (${detail})` : hint);
+    this.name = "MetaError";
+    this.status = status;
+    this.hint = hint;
+    this.detail = detail;
   }
-  return aiClient;
 }
+
+function hintFor(status: number): string {
+  if (status === 401 || status === 403) return "Meta rejected the API key. Check META_API_KEY and that it has Meta Model API access.";
+  if (status === 404) return "Meta says not found. Usually a wrong model name or base URL: check META_TEXT_MODEL, META_IMAGE_MODEL and META_BASE_URL.";
+  if (status === 400 || status === 415 || status === 422) return "Meta rejected the request. Often the image format or size, or an unfulfillable directive.";
+  if (status === 408 || status === 504) return "Meta (or a gateway in front of it) timed out.";
+  if (status === 429) return "Rate limit hit or credits used up on Meta API.";
+  if (status >= 500) return "Meta had a server error. Try again in a moment.";
+  return `Meta returned HTTP ${status}.`;
+}
+
+// Short, user-facing text for any error (shown in the app).
+function clientMessage(e: any): string {
+  return e?.message || "Something went wrong on the server.";
+}
+
+const META_TIMEOUT_MS = Number(process.env.META_TIMEOUT_MS) || 150000;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// ---- a small built-in test photo (no files needed) --------------------------------------
+function crc32(buf: Buffer): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc ^= buf[i];
+    for (let k = 0; k < 8; k++) crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function pngChunk(type: string, data: Buffer): Buffer {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length);
+  const td = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(td));
+  return Buffer.concat([len, td, crc]);
+}
+// 640x480 PNG: wall, floor, window and sofa blocks for health-check testing.
+function makeTestRoomPng(): Buffer {
+  const W = 640, H = 480;
+  const raw = Buffer.alloc((W * 3 + 1) * H);
+  for (let y = 0; y < H; y++) {
+    const row = y * (W * 3 + 1);
+    raw[row] = 0;
+    for (let x = 0; x < W; x++) {
+      let r = 232, g = 226, b = 214; // wall
+      if (y > 340) { r = 150; g = 110; b = 80; } // floor
+      if (x >= 420 && x < 580 && y >= 70 && y < 230) {
+        r = 200; g = 225; b = 245; // window
+        if (x < 426 || x >= 574 || y < 76 || y >= 224) { r = 120; g = 120; b = 120; } // frame
+      }
+      if (x >= 60 && x < 340 && y >= 270 && y < 365) { r = 110; g = 120; b = 135; } // sofa
+      const i = row + 1 + x * 3;
+      raw[i] = r; raw[i + 1] = g; raw[i + 2] = b;
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(W, 0);
+  ihdr.writeUInt32BE(H, 4);
+  ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", zlib.deflateSync(raw)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+function metaKey(): string {
+  const key = process.env.META_API_KEY;
+  if (!key) {
+    throw new Error("META_API_KEY is missing. Add it as a secret / environment variable and restart.");
+  }
+  return key;
+}
+
+async function metaFetch(path: string, init: { method: string; headers?: Record<string, string>; body?: any }) {
+  const started = Date.now();
+  const secs = () => ((Date.now() - started) / 1000).toFixed(1);
+  let lastErr: any;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), META_TIMEOUT_MS);
+    try {
+      const res = await fetch(`${META_BASE}${path}`, {
+        ...init,
+        signal: ctrl.signal,
+        headers: { Authorization: `Bearer ${metaKey()}`, ...(init.headers || {}) },
+      });
+      const raw = await res.text();
+      clearTimeout(timer);
+      if (!res.ok) {
+        const err = new MetaError(res.status, hintFor(res.status), raw.replace(/\s+/g, " ").slice(0, 300));
+        if ((res.status === 429 || res.status >= 502) && attempt === 0) {
+          console.warn(`[meta] ${path} -> ${res.status} after ${secs()}s, retrying once`);
+          lastErr = err;
+          await sleep(1500);
+          continue;
+        }
+        throw err;
+      }
+      let json: any;
+      try {
+        json = JSON.parse(raw);
+      } catch {
+        throw new MetaError(res.status, "Meta returned a reply that is not JSON.", raw.replace(/\s+/g, " ").slice(0, 200));
+      }
+      console.log(`[meta] ${init.method} ${path} -> ${res.status} in ${secs()}s`);
+      return json;
+    } catch (e: any) {
+      clearTimeout(timer);
+      if (e instanceof MetaError) {
+        console.error(`[meta] ${path} failed after ${secs()}s: ${e.message}`);
+        throw e;
+      }
+      const timedOut = e?.name === "AbortError";
+      const err = new MetaError(
+        timedOut ? 504 : 0,
+        timedOut ? `No answer from Meta after ${Math.round(META_TIMEOUT_MS / 1000)}s.` : "Could not reach Meta (network error).",
+        timedOut ? "" : String(e?.cause?.code || e?.message || e)
+      );
+      if (!timedOut && attempt === 0) {
+        console.warn(`[meta] ${path} network error after ${secs()}s, retrying once: ${err.message}`);
+        lastErr = err;
+        await sleep(1500);
+        continue;
+      }
+      console.error(`[meta] ${path} failed after ${secs()}s: ${err.message}`);
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
+// Muse Spark: text, or text + image (content = string OR an array of text/image_url parts).
+async function metaChat(content: any, opts: { temperature?: number; system?: string } = {}): Promise<string> {
+  const messages: any[] = [];
+  if (opts.system) messages.push({ role: "system", content: opts.system });
+  messages.push({ role: "user", content });
+  const data = await metaFetch("/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: META_TEXT_MODEL,
+      messages,
+      ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+    }),
+  });
+  const msg = data?.choices?.[0]?.message?.content;
+  if (Array.isArray(msg)) return msg.map((p: any) => p?.text ?? "").join("");
+  return typeof msg === "string" ? msg : "";
+}
+
+// Muse Image returns either base64 or a URL. Always hand the frontend a data URL.
+async function imageFromResponse(data: any): Promise<string> {
+  const item = data?.data?.[0];
+  if (item?.b64_json) {
+    let mime = "image/png";
+    if (item.b64_json.startsWith("UklGR")) mime = "image/webp";
+    else if (item.b64_json.startsWith("/9j/")) mime = "image/jpeg";
+    return `data:${mime};base64,${item.b64_json}`;
+  }
+  if (item?.url) {
+    const r = await fetch(item.url);
+    if (!r.ok) throw new Error(`Could not download Muse Image result (${r.status})`);
+    const buf = Buffer.from(await r.arrayBuffer());
+    let mime = r.headers.get("content-type") || "image/png";
+    return `data:${mime};base64,${buf.toString("base64")}`;
+  }
+  throw new Error("Muse Image returned no image: " + JSON.stringify(data).slice(0, 300));
+}
+
+// Muse Image: restyle the user's own photo (multipart /images/edits).
+async function metaEditImage(img: { mimeType: string; data: string }, prompt: string): Promise<string> {
+  const form = new FormData();
+  form.append("model", META_IMAGE_MODEL);
+  form.append("prompt", prompt);
+  if (META_IMAGE_SIZE) form.append("size", META_IMAGE_SIZE);
+  const ext = img.mimeType.includes("jpeg") ? "jpg" : img.mimeType.includes("webp") ? "webp" : "png";
+  const bytes = Buffer.from(img.data, "base64");
+  form.append("image", new Blob([bytes as any], { type: img.mimeType }), `room.${ext}`);
+  const startTime = Date.now();
+  console.log(`[Meta Muse Image] Dispatching edit request (prompt length: ${prompt.length})...`);
+  const data = await metaFetch("/images/edits", { method: "POST", body: form });
+  console.log(`[Meta Muse Image] Edit succeeded in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+  return imageFromResponse(data);
+}
+
+// Muse Image: generate from text only (used when no photo is supplied).
+async function metaGenerateImage(prompt: string): Promise<string> {
+  const startTime = Date.now();
+  console.log(`[Meta Muse Image] Dispatching text-to-image request...`);
+  const data = await metaFetch("/images/generations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: META_IMAGE_MODEL,
+      prompt,
+      ...(META_IMAGE_SIZE ? { size: META_IMAGE_SIZE } : {}),
+    }),
+  });
+  console.log(`[Meta Muse Image] Generation succeeded in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+  return imageFromResponse(data);
+}
+// ===================== END META MODEL API HELPERS =====================
+
+// ===================== PRODUCTION LAYER: limits, cache, queue, stats =====================
+const envNum = (name: string, def: number) => {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : def;
+};
+const RATE_WINDOW_MS = envNum("RATE_WINDOW_SECONDS", 600) * 1000;
+const RATE_LIMITS: Record<string, number> = {
+  render: envNum("RATE_LIMIT_RENDERS", 40), // image renders per device per window
+  analyze: envNum("RATE_LIMIT_ANALYSES", 20), // room analyses per device per window
+  health: envNum("RATE_LIMIT_HEALTH", 10), // credit-spending health checks per device per window
+};
+const DAILY_META_CALL_CAP = envNum("DAILY_META_CALL_CAP", 800); // hard ceiling on Meta calls per UTC day
+const META_MAX_CONCURRENCY = envNum("META_MAX_CONCURRENCY", 4); // image calls running at once
+const META_MAX_QUEUE = envNum("META_MAX_QUEUE", 16); // image calls allowed to wait in line
+const CACHE_MAX_BYTES = envNum("CACHE_MAX_MB", 64) * 1024 * 1024;
+
+const sha256 = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
+
+function clientIp(req: any): string {
+  const fwd = String(req.headers?.["x-forwarded-for"] || "").split(",")[0].trim();
+  return fwd || req.socket?.remoteAddress || "unknown";
+}
+
+// Sliding-window rate limit. Returns 0 if allowed, otherwise seconds to wait.
+const rateLog = new Map<string, number[]>();
+function rateCheck(bucket: string, ip: string): number {
+  const key = `${bucket}:${ip}`;
+  const now = Date.now();
+  const hits = (rateLog.get(key) || []).filter((t) => now - t < RATE_WINDOW_MS);
+  if (hits.length >= RATE_LIMITS[bucket]) {
+    rateLog.set(key, hits);
+    return Math.max(1, Math.ceil((hits[0] + RATE_WINDOW_MS - now) / 1000));
+  }
+  hits.push(now);
+  rateLog.set(key, hits);
+  return 0;
+}
+const rateSweeper: any = setInterval(() => {
+  const now = Date.now();
+  for (const [k, hits] of rateLog) {
+    const kept = hits.filter((t) => now - t < RATE_WINDOW_MS);
+    if (kept.length) rateLog.set(k, kept);
+    else rateLog.delete(k);
+  }
+}, 60 * 1000);
+rateSweeper?.unref?.();
+
+const tooFast = (wait: number) =>
+  `Too many requests from this device. Please wait about ${wait} second${wait === 1 ? "" : "s"} and try again.`;
+
+// Server-wide daily budget: protects the API credits even if many devices show up.
+let budgetDay = new Date().toISOString().slice(0, 10);
+let budgetUsed = 0;
+function takeDailyBudget(): boolean {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== budgetDay) {
+    budgetDay = today;
+    budgetUsed = 0;
+  }
+  if (budgetUsed >= DAILY_META_CALL_CAP) return false;
+  budgetUsed++;
+  return true;
+}
+const DAILY_CAP_MESSAGE = "Today's render budget for this demo is used up. Please try again tomorrow.";
+
+// LRU cache sized in bytes (renders are large data URLs).
+function createLruCache(maxBytes: number, maxEntries = 500) {
+  const map = new Map<string, string>();
+  let bytes = 0;
+  return {
+    get(k: string): string | undefined {
+      const v = map.get(k);
+      if (v === undefined) return undefined;
+      map.delete(k);
+      map.set(k, v); // mark as recently used
+      return v;
+    },
+    set(k: string, v: string) {
+      if (v.length > maxBytes) return;
+      const old = map.get(k);
+      if (old !== undefined) {
+        bytes -= old.length;
+        map.delete(k);
+      }
+      map.set(k, v);
+      bytes += v.length;
+      while ((bytes > maxBytes || map.size > maxEntries) && map.size) {
+        const oldestKey = map.keys().next().value as string;
+        bytes -= (map.get(oldestKey) || "").length;
+        map.delete(oldestKey);
+      }
+    },
+    get size() {
+      return map.size;
+    },
+    get bytes() {
+      return bytes;
+    },
+  };
+}
+const renderCache = createLruCache(CACHE_MAX_BYTES);
+const analysisCache = createLruCache(4 * 1024 * 1024);
+const inflightRenders = new Map<string, Promise<string>>(); // identical requests share one Meta call
+
+// Bounded concurrency + bounded queue for image calls (backpressure instead of pile-ups).
+class BusyError extends Error {}
+function createLimiter(maxActive: number, maxQueue: number) {
+  let active = 0;
+  const waiting: (() => void)[] = [];
+  const pump = () => {
+    while (active < maxActive && waiting.length) {
+      active++;
+      const start = waiting.shift() as () => void;
+      start();
+    }
+  };
+  return {
+    run<T>(fn: () => Promise<T>): Promise<T> {
+      if (active >= maxActive && waiting.length >= maxQueue) {
+        return Promise.reject(new BusyError("SameRoom is busy right now. Please try again in a few seconds."));
+      }
+      return new Promise<T>((resolve, reject) => {
+        waiting.push(() => {
+          fn()
+            .then(resolve, reject)
+            .finally(() => {
+              active--;
+              pump();
+            });
+        });
+        pump();
+      });
+    },
+    get active() {
+      return active;
+    },
+    get waiting() {
+      return waiting.length;
+    },
+  };
+}
+const imageLimiter = createLimiter(META_MAX_CONCURRENCY, META_MAX_QUEUE);
+
+const stats = {
+  renderStarted: 0,
+  renderCompleted: 0,
+  renderFailed: 0,
+  renderCacheHits: 0,
+  renderCoalesced: 0,
+  renderSecondsTotal: 0,
+  analysisStarted: 0,
+  analysisCacheHits: 0,
+  rateLimited: 0,
+  dailyCapHits: 0,
+  busyRejected: 0,
+};
+// ===================== END PRODUCTION LAYER =====================
 
 type ImageMime =
   | 'image/png' | 'image/jpeg' | 'image/webp'
@@ -53,9 +420,106 @@ async function startServer() {
 
   app.use(express.json({ limit: "50mb" }));
 
-  // Dev server healthcheck
+  function parseBase64Image(dataUri: string) {
+    if (!dataUri) return null;
+    const match = dataUri.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,([^"]*)$/);
+    if (match && match.length === 3) {
+      return {
+        inlineData: {
+          mimeType: match[1] as ImageMime,
+          data: match[2],
+        },
+      };
+    }
+    return null;
+  }
+
+  // Live counters for the production layer (no secrets).
+  app.get("/api/stats", (_req, res) => {
+    res.json({
+      uptimeSeconds: Math.round(process.uptime()),
+      renders: {
+        started: stats.renderStarted,
+        completed: stats.renderCompleted,
+        failed: stats.renderFailed,
+        cacheHits: stats.renderCacheHits,
+        sharedDuplicates: stats.renderCoalesced,
+        avgSeconds: stats.renderCompleted ? +(stats.renderSecondsTotal / stats.renderCompleted).toFixed(1) : null,
+      },
+      analyses: { started: stats.analysisStarted, cacheHits: stats.analysisCacheHits },
+      protection: {
+        rateLimited: stats.rateLimited,
+        dailyCapHits: stats.dailyCapHits,
+        busyRejected: stats.busyRejected,
+      },
+      dailyBudget: { day: budgetDay, used: budgetUsed, cap: DAILY_META_CALL_CAP },
+      queue: { active: imageLimiter.active, waiting: imageLimiter.waiting, maxConcurrent: META_MAX_CONCURRENCY, maxWaiting: META_MAX_QUEUE },
+      cache: { renders: renderCache.size, approxMB: +(renderCache.bytes / 1048576).toFixed(1) },
+      rateLimits: { windowSeconds: RATE_WINDOW_MS / 1000, ...RATE_LIMITS },
+    });
+  });
+
+  // Basic Health check
   app.get("/api/health", (_req, res) => {
-    res.status(200).json({ status: "ok" });
+    res.status(200).json({
+      status: "ok",
+      provider: "meta",
+      engine: "Meta Model API",
+      textModel: META_TEXT_MODEL,
+      imageModel: META_IMAGE_MODEL,
+      metaConfigured: Boolean(process.env.META_API_KEY),
+    });
+  });
+
+  // Self-test. Open /api/meta-health in the browser.
+  //   (no params)  -> checks your key + the text model
+  //   ?image=1     -> also checks Muse Image text-to-image (spends a little credit)
+  //   ?edit=1      -> also checks the photo-edit endpoint the app uses, with a built-in test photo
+  app.get("/api/meta-health", async (req, res) => {
+    if (req.query.image === "1" || req.query.edit === "1") {
+      const w = rateCheck("health", clientIp(req));
+      if (w) {
+        res.setHeader("Retry-After", String(w));
+        return res.status(429).json({ error: tooFast(w), retryAfterSeconds: w });
+      }
+    }
+    const out: any = {
+      baseUrl: META_BASE,
+      textModel: META_TEXT_MODEL,
+      imageModel: META_IMAGE_MODEL,
+      keySet: !!process.env.META_API_KEY,
+      timeoutSeconds: META_TIMEOUT_MS / 1000,
+    };
+    const run = async (key: string, fn: () => Promise<any>) => {
+      const t0 = Date.now();
+      try {
+        Object.assign(out, await fn());
+        out[`${key}Ok`] = true;
+      } catch (e: any) {
+        out[`${key}Ok`] = false;
+        out[`${key}Error`] = clientMessage(e);
+      }
+      out[`${key}Seconds`] = +((Date.now() - t0) / 1000).toFixed(1);
+    };
+    await run("text", async () => ({ reply: await metaChat("Reply with exactly: Meta API works.") }));
+    if (req.query.image === "1") {
+      await run("image", async () => {
+        const img = await metaGenerateImage("A simple bright living room, photorealistic.");
+        return { imageApproxKB: Math.round(img.length / 1024) };
+      });
+    }
+    if (req.query.edit === "1") {
+      await run("edit", async () => {
+        const png = makeTestRoomPng();
+        const img = await metaEditImage(
+          { mimeType: "image/png", data: png.toString("base64") },
+          "Restyle this simple room photo in warm Japandi style. Keep the same walls, window and sofa positions."
+        );
+        return { editApproxKB: Math.round(img.length / 1024) };
+      });
+    }
+    const failed = out.textOk === false || out.imageOk === false || out.editOk === false;
+    res.status(failed ? 500 : 200).json(out);
   });
 
   // In-memory cache for shared room styles
@@ -69,7 +533,6 @@ async function startServer() {
         return res.status(400).json({ error: "Invalid share data: styleName is required" });
       }
 
-      // Generate a short, url-friendly share ID
       const shareId = "r_" + Math.random().toString(36).substring(2, 8) + Date.now().toString(36).substring(4);
       const record = {
         ...shareData,
@@ -77,7 +540,6 @@ async function startServer() {
         createdAt: Date.now()
       };
 
-      // Keep up to 300 recent shared room styles
       if (sharedStylesMap.size >= 300) {
         const oldest = sharedStylesMap.keys().next().value;
         if (oldest) sharedStylesMap.delete(oldest);
@@ -110,20 +572,6 @@ async function startServer() {
     }
   });
 
-  function parseBase64Image(dataUri: string) {
-    if (!dataUri) return null;
-    const match = dataUri.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,([^"]*)$/);
-    if (match && match.length === 3) {
-      return {
-        inlineData: {
-          mimeType: match[1] as ImageMime,
-          data: match[2],
-        },
-      };
-    }
-    return null;
-  }
-
   app.post("/api/generate", async (req, res) => {
     try {
       const {
@@ -142,7 +590,6 @@ async function startServer() {
         lensCalibration,
         tweakColor,
         lightingTimeOfDay,
-        // NEW — cross-angle consistency controls
         referenceRenderBase64,
         designManifest = ""
       } = req.body;
@@ -159,236 +606,162 @@ async function startServer() {
       }
 
       const parsedImages = rawImages.map(parseBase64Image).filter(Boolean) as { inlineData: { mimeType: ImageMime; data: string } }[];
+      if (rawImages.length > 0 && parsedImages.length === 0) {
+        return res.status(400).json({
+          error: "Could not read the photo. Please use a JPG, WebP, or PNG.",
+        });
+      }
 
-      let parts: any[] = [];
       const humanRoom = roomType && roomType !== "auto" && roomType !== "room" ? roomType : "room";
+      const isExterior = /exterior|facade|elevation|garden|landscape|yard|curb|outdoor|patio|balcony|courtyard|aangan|verandah|thinnai|terrace/i.test(humanRoom);
 
       // Palette hints if provided
       let paletteHint = "";
       if (paletteSpecs) {
-        const dom = paletteSpecs.dominant ? `60% Main Walls: ${paletteSpecs.dominant.name} (${paletteSpecs.dominant.hex || ''})` : "";
-        const sec = paletteSpecs.secondary ? `30% Trim & Millwork: ${paletteSpecs.secondary.name} (${paletteSpecs.secondary.hex || ''})` : "";
-        const acc = paletteSpecs.accent ? `10% Accent Details: ${paletteSpecs.accent.name} (${paletteSpecs.accent.hex || ''})` : "";
+        const dom = paletteSpecs.dominant ? `60% Main: ${paletteSpecs.dominant.name} (${paletteSpecs.dominant.hex || ''})` : "";
+        const sec = paletteSpecs.secondary ? `30% Secondary: ${paletteSpecs.secondary.name} (${paletteSpecs.secondary.hex || ''})` : "";
+        const acc = paletteSpecs.accent ? `10% Accent: ${paletteSpecs.accent.name} (${paletteSpecs.accent.hex || ''})` : "";
         paletteHint = [dom, sec, acc].filter(Boolean).join("; ");
       }
 
-      // Lens and dimension guidance
-      let opticalGuidance = "";
-      if (lensCalibration === "0.5x" || lensCalibration === "ultra_wide") {
-        opticalGuidance = `
-CAMERA OPTICS & DISTANCE CALIBRATION (0.5x ULTRA-WIDE LENS):
-- The original room photo was captured on a 0.5x ultra-wide smartphone lens (~13mm focal length, ~120° FOV).
-- Ultra-wide lenses cause optical barrel expansion: the center of the room appears deeper/further away than in real life, and peripheral edges stretch.
-- ACCOUNT FOR THIS OPTICAL DISTORTION: Calculate true physical spatial depth (typically 10-15 ft / 3-4.5m room depth).
-- Do not stretch furniture unnaturally. Maintain physically accurate real-world scale and human proportions.`;
-      }
-
-      let furnitureScaleGuidance = "";
-      if (bedSize) {
-        furnitureScaleGuidance = `
-SPECIFIC FURNITURE DIMENSIONS (BED SCALING CODE):
-- Requested Bed Scale: ${bedSize}.
-  * If Single / Twin: 38" wide × 75" long (~1.0m × 1.9m) — occupies narrow footprint, leaving ample side clearance.
-  * If Full / Double: 54" wide × 75" long (~1.4m × 1.9m) — moderate footprint.
-  * If Queen: 60" wide × 80" long (~1.5m × 2.0m) — standard master bed scale, requires at least 24"-30" side clearance to walls.
-  * If King: 76" wide × 80" long (~1.9m × 2.0m) — wide footprint, dominant central placement.
-- Position and scale the bed strictly according to these physical dimensions relative to the room's walls, door swings, and window sills.`;
-      }
-
-      let colorTweakGuidance = "";
-      if (tweakColor) {
-        colorTweakGuidance = `
-SPECIFIC COLOR REFINEMENT DIRECTIVE:
-- Paint / Color tone adjustment requested by user: "${tweakColor}".
-- Apply this exact color tone to the designated surface (e.g. accent wall, main walls, or textiles) with realistic architectural light bounce and natural shadows.`;
-      }
-
-      let lightingGuidance = "";
-      if (lightingTimeOfDay === "golden_hour") {
-        lightingGuidance = `
-LIGHTING TEMPERATURE DIRECTIVE (GOLDEN HOUR - ~2800K WARM AMBER):
-- Bathe the interior in low-angle, warm honey-golden sunlight streaming through windows.
-- Cast long, soft directional shadows across the floor. Warm incandescent/amber pools of light (~2700K) from sconces and lamps.`;
-      } else if (lightingTimeOfDay === "bright_noon") {
-        lightingGuidance = `
-LIGHTING TEMPERATURE DIRECTIVE (BRIGHT NOON - ~5500K CRISP DAYLIGHT):
-- High-noon overhead sun delivering pure, crisp, neutral daylight through windows.
-- Pristine color rendering, high visual clarity, balanced soft daylight wash with crisp true-to-life architectural surfaces.`;
-      } else if (lightingTimeOfDay === "blue_hour") {
-        lightingGuidance = `
-LIGHTING TEMPERATURE DIRECTIVE (BLUE HOUR - ~8500K TWILIGHT INDIGO):
-- Capture the room at blue hour / twilight immediately after sunset.
-- Deep cyan and indigo twilight atmosphere visible outside windows, contrasting with warm glowing interior lamps (2700K). Cozy, cinematic evening mood.`;
-      }
-
-      let customDirectivesGuidance = "";
-      if (customDirectives && customDirectives.trim()) {
-        customDirectivesGuidance = `
-MANDATORY FURNITURE, APPLIANCE & ROOM LAYOUT DIRECTIVES (USER SPECIFIED - MUST HONOR):
-- SPECIFIC USER DIRECTIVES: "${customDirectives.trim()}"
-- APPLIANCE & FURNITURE PLACEMENT: If the user requests adding appliances or furniture (e.g., refrigerator/fridge, sofa, sectional, dining table, chairs, kitchen island, desk, bed, TV, or coffee bar), YOU MUST EXPLICITLY PLACE AND RENDER THESE ITEMS IN THE ROOM.
-- SPATIAL ARRANGEMENT: Accurately follow the user's layout positioning (e.g., "fridge in the left corner", "L-shaped sofa facing window", "kitchen island in center with barstools").
-- STYLE HARMONIZATION: Design the added furniture/appliances in the aesthetic and materials of the chosen style (${prompt}).`;
-      }
-
-      // NEW — cross-angle consistency: a reference render of the same room from another
-      // angle, plus a locked design manifest, so every angle shares one identity.
-      const referenceRender = referenceRenderBase64 ? parseBase64Image(referenceRenderBase64) : null;
-      let consistencyGuidance = "";
-      if (designManifest) {
-        consistencyGuidance = `
-CROSS-ANGLE CONSISTENCY (CRITICAL — this same room is rendered from several camera angles; every angle MUST match):
-- Render the SAME furniture, SAME materials, SAME wall colours and SAME layout in every angle. Do NOT add, remove, or reposition pieces between angles.
-- LOCKED DESIGN MANIFEST (do not deviate):
-${designManifest}
-- Only the camera viewpoint changes between renders. Keep the design identity identical.`;
-      }
-
       if (parsedImages.length > 0) {
-        // Determine the target photo for this viewpoint
         let targetIndex = 0;
         if (mode === "angle") {
           targetIndex = Math.min(Math.max(0, targetAngleIndex), parsedImages.length - 1);
         }
         const targetImage = parsedImages[targetIndex];
 
-        const isExterior = /exterior|garden|landscape|courtyard|aangan|verandah|thinnai|terrace|patio|facade|elevation|backyard|outdoors/i.test(humanRoom);
-        let editDirective = "";
-
+        // Synthesize a concise, high-impact architectural directive tailored for Meta Muse Image (<400 chars for optimal latency)
+        const promptSnippets: string[] = [];
         if (stylingMode === "paint_only") {
-          editDirective = `PHOTO EDITING TASK: In-place ${isExterior ? "exterior facade/wall color & paint" : "wall color & paint"} makeover of THIS EXACT ${humanRoom.toUpperCase()} shown in the photograph.
-STRICTEST ARCHITECTURAL & FURNITURE PRESERVATION (CRITICAL):
-1. PRESERVE 100% OF EXISTING ${isExterior ? "BUILDING ELEVATION, BOUNDARY WALLS & OUTDOOR ELEMENTS" : "FURNITURE & LAYOUT"}: Keep every ${isExterior ? "building mass, door, window, wall, tree, and hardscape boundary" : "sofa, chair, bed, desk, table, lamp, rug, shelving, window frame, door, and floor"} exactly as they appear in this photo. DO NOT remove, replace, or relocate unless requested in directives below.
-2. ONLY REPAINT AND RE-TINT:
-   - Repaint the main ${isExterior ? "facade walls, exterior plaster, and boundary surfaces" : "walls and ceiling"} in: ${tweakColor || paletteHint || prompt}.
-   - Keep architectural moldings, trims, and structural accents crisp and clean.
-   - Adjust soft accent tones subtly to harmonize with the new paint.
-3. PRESERVE CAMERA VIEWPOINT: The camera angle, perspective, and natural daylight direction must remain 100% identical.
-4. Output must look unquestionably like the user's actual ${isExterior ? "exterior property/garden" : "room"} in this photo, with newly painted architectural surfaces. Photorealistic, clean architectural lighting.
-${customDirectivesGuidance}
-${opticalGuidance}
-${colorTweakGuidance}
-${lightingGuidance}`;
+          promptSnippets.push(`Architectural repaint of this exact ${humanRoom}. Strictly preserve all original furniture, layout, walls, and windows.`);
+          if (tweakColor) promptSnippets.push(`Repaint surfaces in ${tweakColor}.`);
+          else if (paletteHint) promptSnippets.push(`Repaint using palette: ${paletteHint}.`);
+          else promptSnippets.push(`Repaint in ${prompt}.`);
         } else if (stylingMode === "declutter_polish") {
-          editDirective = `PHOTO EDITING TASK: In-place declutter and styling refresh of THIS EXACT ${humanRoom.toUpperCase()} in the photograph.
-PRESERVATION & POLISH RULES:
-1. Retain the user's actual ${isExterior ? "grounds, facade walls, paving, and garden structure" : "room layout, key furniture pieces, floor, walls, and window locations"} from this photograph.
-2. Clean up loose clutter, organize surfaces, neaten garden paths or seating.
-3. Elevate styling with: ${prompt} (${paletteHint}).
-4. Add balanced, warm natural lighting matching the existing environment.
-5. The result must be recognizably the user's own property, elevated and professionally styled.
-${customDirectivesGuidance}
-${opticalGuidance}
-${furnitureScaleGuidance}
-${colorTweakGuidance}
-${lightingGuidance}`;
+          promptSnippets.push(`Professional declutter and architectural styling refresh of this exact ${humanRoom} in ${prompt}. Retain existing room layout, perspective, walls, and flooring.`);
         } else if (stylingMode === "virtual_staging") {
-          editDirective = `PHOTO EDITING TASK: Virtual staging of THIS EXACT EMPTY/SEMI-EMPTY ${humanRoom.toUpperCase()} shown in the photograph.
-PRESERVATION & STAGING RULES:
-1. PRESERVE THE ARCHITECTURAL SHELL: The ${isExterior ? "building facade, boundary walls, floor/ground boundaries, and perspective" : "walls, ceiling, window frames, door openings, floor boundaries, and perspective"} must match this photograph exactly.
-2. Stage and furnish the ${humanRoom} in ${prompt} (${paletteHint}):
-   - Place appropriately scaled ${isExterior ? "outdoor furniture, planters, pergola, or landscape features" : "furniture tailored specifically to this room's exact dimensions and circulation pathways"}.
-   - Match daylight angle and shadows shown in the photo.
-3. Photorealistic high-resolution architectural photography.
-${customDirectivesGuidance}
-${opticalGuidance}
-${furnitureScaleGuidance}
-${colorTweakGuidance}
-${lightingGuidance}`;
-        } else if (stylingMode === "custom") {
-          editDirective = `PHOTO EDITING TASK: Custom user styling and tweaking of THIS EXACT ${humanRoom.toUpperCase()} shown in the photograph.
-USER TWEAK INSTRUCTIONS: "${customDirectives || tweakColor || prompt}".
-STYLE & COLOR CONTEXT: ${prompt || ''} (${paletteHint || ''}).
-CRITICAL RULES:
-1. Retain the exact architecture, camera angle, walls, boundaries, and perspective from this photo unless specifically requested by the user.
-2. Apply the requested tweaks faithfully to this specific space.
-${customDirectivesGuidance}
-${opticalGuidance}
-${furnitureScaleGuidance}
-${colorTweakGuidance}
-${lightingGuidance}
-3. Photorealistic, natural lighting.`;
+          promptSnippets.push(`Virtual staging of this exact ${humanRoom} in ${prompt}. Preserve exact room walls, windows, door frames, and perspective. Add tastefully scaled furniture.`);
         } else if (isExterior) {
-          // Exterior architectural & garden restyle
-          editDirective = `PHOTO EDITING TASK: In-place architectural EXTERIOR, GARDEN & LANDSCAPE restyle of THIS EXACT ${humanRoom.toUpperCase()} shown in the photograph.
-CRITICAL STRUCTURAL PRESERVATION:
-1. Maintain the EXACT camera angle, building envelope, elevation massing, window/door placements, rooflines, boundary walls, and plot perimeter visible in this photo. DO NOT generate an unrelated stock photo house.
-2. IN-PLACE EXTERIOR & LANDSCAPE RESTYLING IN ${prompt}:
-   - Redesign facade surfaces, exterior wall cladding, stone/brick finishes in: ${tweakColor || paletteHint || prompt}.
-   - Transform landscaping, garden lawns, paving (Kota/Dholpur stone, slate pavers, travertine, or cobblestone), and outdoor features (pergolas, teakwood jhula/swings, terracotta jali screens, water fountains/urlis, outdoor seating, lush tropical plants like champa, frangipani, and bougainvillea).
-   - Keep natural sunlight direction, sky lighting, and shadows consistent with the original photo.
-3. Ultra high-resolution architectural exterior & landscape photography, photorealistic, natural daylight.
-${customDirectivesGuidance}
-${opticalGuidance}
-${furnitureScaleGuidance}
-${colorTweakGuidance}
-${lightingGuidance}`;
+          promptSnippets.push(`Architectural exterior and landscape restyling of this exact property in ${prompt}. Preserve exact building elevation massing, window/door placements, rooflines, and boundary walls.`);
         } else {
-          // Default: interior architectural_restyle
-          editDirective = `PHOTO EDITING TASK: In-place architectural interior restyle of THIS EXACT ${humanRoom.toUpperCase()} shown in the photograph.
-CRITICAL STRUCTURAL PRESERVATION:
-1. Maintain the EXACT camera angle, perspective, walls, ceiling height, window openings, window panes, door frames, and floor boundaries visible in this photo. DO NOT generate an unrelated stock photo room.
-2. IN-PLACE RESTYLING IN ${prompt}:
-   - Redesign wall paint/surfaces in: ${tweakColor || paletteHint || prompt}.
-   - Update furniture, area rugs, drapery, and lighting fixtures to match the aesthetic, scaled precisely to fit this specific room's proportions and walkways.
-   - Keep window daylight orientation and shadows consistent with the original photo.
-3. Ultra high-resolution architectural interior photography, photorealistic, cinematic natural light.
-${customDirectivesGuidance}
-${opticalGuidance}
-${furnitureScaleGuidance}
-${colorTweakGuidance}
-${lightingGuidance}`;
+          promptSnippets.push(`In-place architectural interior restyling of this exact ${humanRoom} in ${prompt}. Preserve exact room walls, ceiling height, window openings, door frames, and perspective.`);
         }
 
-        const finalDirective = editDirective + consistencyGuidance;
-
-        // Build the parts. When a reference render of the same room (from another
-        // already-approved angle) is supplied, include it so the model matches the
-        // established design identity rather than inventing a fresh room each time.
-        parts = [targetImage];
-        if (referenceRender) {
-          parts.push({
-            text: "REFERENCE RENDER — this is the already-approved design of THIS SAME ROOM seen from another camera angle. Match its furniture, materials, palette, fixtures and overall mood EXACTLY. Only the camera viewpoint differs from the first image; do not redesign anything."
-          });
-          parts.push(referenceRender);
+        if (paletteHint && stylingMode !== "paint_only") {
+          promptSnippets.push(`Palette: ${paletteHint}.`);
         }
-        parts.push({ text: finalDirective });
+        if (customDirectives && customDirectives.trim()) {
+          promptSnippets.push(`User directives: ${customDirectives.trim()}.`);
+        }
+        if (tweakColor && stylingMode !== "paint_only") {
+          promptSnippets.push(`Apply ${tweakColor} tone.`);
+        }
+        if (bedSize && bedSize !== "None") {
+          promptSnippets.push(`Scaled for ${bedSize} bed.`);
+        }
+        if (lightingTimeOfDay === "golden_hour") {
+          promptSnippets.push(`Warm golden hour natural sunlight (~2800K).`);
+        } else if (lightingTimeOfDay === "bright_noon") {
+          promptSnippets.push(`Crisp bright noon daylight (~5500K).`);
+        } else if (lightingTimeOfDay === "blue_hour") {
+          promptSnippets.push(`Cinematic blue hour twilight with warm interior lighting.`);
+        }
+        promptSnippets.push(`High resolution architectural photography, photorealistic, natural lighting.`);
+
+        const conciseDirective = promptSnippets.join(" ");
+
+        // Production layer: cache check -> join identical in-flight call -> rate limit -> daily cap -> queue
+        const cacheKey = sha256(`${META_IMAGE_MODEL}\n${targetImage.inlineData.data}\n${conciseDirective}`);
+        const cachedUrl = renderCache.get(cacheKey);
+        if (cachedUrl) {
+          stats.renderCacheHits++;
+          console.log(`[Cache Hit] Returning cached render for ${humanRoom} (${stylingMode})`);
+          return res.json({ imageUrl: cachedUrl, mode, targetAngleIndex, provider: "meta", cached: true });
+        }
+
+        let job = inflightRenders.get(cacheKey);
+        if (job) {
+          stats.renderCoalesced++;
+          console.log(`[In-Flight Deduplication] Reusing active render promise for ${humanRoom}`);
+        } else {
+          const wait = rateCheck("render", clientIp(req));
+          if (wait) {
+            stats.rateLimited++;
+            res.setHeader("Retry-After", String(wait));
+            return res.status(429).json({ error: tooFast(wait), retryAfterSeconds: wait });
+          }
+          if (!takeDailyBudget()) {
+            stats.dailyCapHits++;
+            return res.status(429).json({ error: DAILY_CAP_MESSAGE });
+          }
+
+          console.log(
+            `[generate] room="${humanRoom}" mode=${stylingMode} photo=${Math.round((targetImage.inlineData.data.length * 0.75) / 1024)}KB promptChars=${conciseDirective.length} queue=${imageLimiter.active}/${imageLimiter.waiting}`
+          );
+          stats.renderStarted++;
+          const t0 = Date.now();
+          job = imageLimiter
+            .run(() => metaEditImage(targetImage.inlineData, conciseDirective))
+            .then(
+              (url) => {
+                renderCache.set(cacheKey, url);
+                stats.renderCompleted++;
+                stats.renderSecondsTotal += (Date.now() - t0) / 1000;
+                return url;
+              },
+              (e) => {
+                stats.renderFailed++;
+                throw e;
+              }
+            )
+            .finally(() => inflightRenders.delete(cacheKey));
+          inflightRenders.set(cacheKey, job);
+        }
+
+        const imageUrl = await job;
+        res.json({ imageUrl, mode, targetAngleIndex, provider: "meta" });
       } else {
-        parts = [{ text: `Interior architectural photography of a ${humanRoom} in ${prompt}. Photorealistic, cinematic lighting. ${opticalGuidance} ${furnitureScaleGuidance} ${colorTweakGuidance} ${lightingGuidance} ${consistencyGuidance}` }];
-      }
-
-      const ai = getAiClient();
-      const validAspectRatios = ["1:1", "3:4", "4:3", "9:16", "16:9"];
-      const chosenAspect = validAspectRatios.includes(aspectRatio)
-        ? aspectRatio
-        : mode === "overview"
-        ? "16:9"
-        : "4:3";
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite-image',
-        contents: { parts },
-        config: {
-          imageConfig: { aspectRatio: chosenAspect as any }
-        },
-      });
-      let base64EncodeString = "";
-      for (const part of response.candidates?.[0]?.content?.parts || []) {
-        if (part.inlineData) {
-          base64EncodeString = part.inlineData.data;
-          break;
+        const textPrompt = `High resolution architectural photography of a ${humanRoom} in ${prompt}. Photorealistic, natural lighting.`;
+        const cacheKey = sha256(`${META_IMAGE_MODEL}\ntext_only\n${textPrompt}`);
+        const cachedUrl = renderCache.get(cacheKey);
+        if (cachedUrl) {
+          stats.renderCacheHits++;
+          return res.json({ imageUrl: cachedUrl, mode, targetAngleIndex, provider: "meta", cached: true });
         }
-      }
 
-      if (!base64EncodeString) {
-        return res.status(500).json({ error: "No image generated" });
-      }
+        const wait = rateCheck("render", clientIp(req));
+        if (wait) {
+          stats.rateLimited++;
+          res.setHeader("Retry-After", String(wait));
+          return res.status(429).json({ error: tooFast(wait), retryAfterSeconds: wait });
+        }
+        if (!takeDailyBudget()) {
+          stats.dailyCapHits++;
+          return res.status(429).json({ error: DAILY_CAP_MESSAGE });
+        }
 
-      const imageUrl = `data:image/png;base64,${base64EncodeString}`;
-      res.json({ imageUrl, mode, targetAngleIndex });
+        stats.renderStarted++;
+        const t0 = Date.now();
+        const imageUrl = await imageLimiter.run(() => metaGenerateImage(textPrompt));
+        renderCache.set(cacheKey, imageUrl);
+        stats.renderCompleted++;
+        stats.renderSecondsTotal += (Date.now() - t0) / 1000;
+
+        res.json({ imageUrl, mode, targetAngleIndex, provider: "meta" });
+      }
     } catch (error: any) {
-      console.error("Error generating image:", error);
-      res.status(500).json({ error: error.message || "Failed to generate image" });
+      console.error("Error generating image:", error?.message || error);
+      if (error instanceof BusyError) {
+        stats.busyRejected++;
+        res.setHeader("Retry-After", "5");
+        return res.status(503).json({ error: error.message });
+      }
+      const upstream = error instanceof MetaError;
+      res.status(upstream ? 502 : 500).json({
+        error: clientMessage(error) || "Failed to generate image",
+        upstreamStatus: upstream ? error.status : undefined,
+      });
     }
   });
 
@@ -404,8 +777,24 @@ ${lightingGuidance}`;
       if (!parsed) {
         return res.status(400).json({ error: "Invalid image format" });
       }
+      const analyzeKey = sha256(`analyze\n${META_TEXT_MODEL}\n${parsed.inlineData.data}`);
+      const cachedAnalysis = analysisCache.get(analyzeKey);
+      if (cachedAnalysis) {
+        stats.analysisCacheHits++;
+        return res.json({ ...JSON.parse(cachedAnalysis), cached: true });
+      }
+      const waitA = rateCheck("analyze", clientIp(req));
+      if (waitA) {
+        stats.rateLimited++;
+        res.setHeader("Retry-After", String(waitA));
+        return res.status(429).json({ error: tooFast(waitA), retryAfterSeconds: waitA });
+      }
+      if (!takeDailyBudget()) {
+        stats.dailyCapHits++;
+        return res.status(429).json({ error: DAILY_CAP_MESSAGE });
+      }
+      stats.analysisStarted++;
 
-      const ai = getAiClient();
       const prompt = `You are a licensed interior architect and 3D computer vision spatial analyst.
 Analyze this room photograph with specific focus on:
 1. CAMERA PERSPECTIVE & LENS DISTORTION:
@@ -447,21 +836,18 @@ Return a clean JSON object ONLY (valid JSON, no markdown backticks, no fences):
   "structuralAnchorsDetected": ["Standard doorway opening", "Window sill height", "Floor-to-ceiling corner joint"]
 }`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: [
-          { inlineData: { mimeType: parsed.inlineData.mimeType, data: parsed.inlineData.data } },
-          { text: prompt }
+      const text = await metaChat(
+        [
+          { type: "text", text: prompt + "\n\nReturn ONLY the JSON object. No markdown, no code fences, no commentary." },
+          { type: "image_url", image_url: { url: `data:${parsed.inlineData.mimeType};base64,${parsed.inlineData.data}` } },
         ],
-        config: {
-          temperature: 0.2,
-          responseMimeType: "application/json"
-        }
-      });
-
-      const text = response.text || "{}";
-      const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
-      const data = JSON.parse(cleaned);
+        { temperature: 0.2 }
+      );
+      const cleaned = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+      const first = cleaned.indexOf("{");
+      const last = cleaned.lastIndexOf("}");
+      const data = JSON.parse(first >= 0 && last > first ? cleaned.slice(first, last + 1) : cleaned);
+      analysisCache.set(analyzeKey, JSON.stringify(data));
       res.json(data);
     } catch (e: any) {
       console.error("Error analyzing room dimensions:", e);
@@ -492,84 +878,22 @@ Return a clean JSON object ONLY (valid JSON, no markdown backticks, no fences):
     }
   });
 
-  // Endpoint to generate prompt
+  // Prompt generation assistant using Meta Muse Spark
   app.post('/api/generate-prompt', async (req, res) => {
     try {
-      const { productDesc, atmosphereDesc, productImages = [], atmosphereImages = [] }: GenerateBody = req.body;
-      const ai = getAiClient();
-
-      const promptWriterSystemInstruction = `## Role
-You are an elite product-film director, editor and Gemini Omni prompt engineer in one box. You receive a handful of plain inputs from an everyday seller and return one flawless, timestamped Omni directive prompt that yields a premium, short-form product showcase reel built from several shots. You direct like a luxury commercial and cut like a master editor. Your taste is the product: restrained, expensive, clarifying. Never slop, never gimmick, never overclaim.
-Inputs you receive
-1–4 product reference images — e-commerce style, white background; any mix of front, side, top, detail views.
-A short product description — what it is, plus key aesthetic details (plain language).
-A simple style brief — often only a few words (e.g. "white studio", "clinical skincare lab"). May include a camera or shot request.
-Optional extra notes — treat any later or added input as an override.
-Non-negotiable taste
-Classy, simple, high-end. A tight, deliberate edit where every cut earns its place.
-Forbidden: vulgar, crass, busy, cheap, "AI-looking", frantic over-cutting.
-Premium = restraint and intent: controlled palette, motivated light, real materials behaving correctly, a confident rhythm.
-Format & length
-~10 seconds total. 2–7 shots. You decide the count for this product — never pad to seven.
-Each shot = one timestamp. Beats typically 1–2s; vary deliberately.
-Cut with an editor's eye: hook on frame one, vary scale and angle every cut, end on a held hero the product reads on.
-Omni craft you apply
-Levers per shot: subject · camera framing + motion · style · lighting · location. Detail buys control; specify deliberately, never bloat.
-Reference the images. Lock identity, geometry, proportions, label and material from all views. The product never distorts, rebrands, or sprouts features it doesn't have — identity holds across every cut.
-Camera repertoire. Draw across shots: "slow push in", "orbit / arc", "macro detail", "rack focus", "top-down reveal", "gentle levitation", "locked off", "static", "dolly", "natural smartphone zoom".
-Physics & materials. Omni reasons about gravity, fluids and light. Make glass refract, metal catch a rim, serum bead, powder settle — accurately.
-World knowledge. Don't over-explain. State intent and let Omni reason the rest.
-Hard suppressions (always enforce in the output)
-No music of any kind. No score, soundtrack, background music, beat, or musical sting — ever.
-No voice. No voiceover, narration, dialogue or vocals.
-No overlaid graphics. No on-screen text, titles, captions, subtitles, lower thirds, typography, added logos, badges, watermarks or UI. The only text permitted is what physically exists on the product itself.
-Audio is near-silent: only very subtle, realistic diegetic sound effects (a faint surface tap, soft glass chime, gentle fabric or air, a single liquid drop). Often barely there.
-Editing patterns (the repertoire)
-Sequencing: open with a hook (hero or striking detail) → vary shot scale and angle so each cut feels intentional → match-cut on motion or shape where possible → accent a beat or two → land on a clean, held hero frame.
-Rhythm: brisk but never frantic; let the final shot breathe ~0.5s longer.
-Default arc (adapt, don't obey): hero wide → macro detail → arc → push-in → held hero.
-Method (run silently, then output)
-Read the product — category, material, finish, features most worth showing.
-Translate the brief into a crafted environment, palette and light. Elevate; never literalise crudely.
-"white studio" → seamless cyclorama, soft key, gentle floor gradient, one clean shadow.
-"clinical / skincare lab" → cool neutral palette, glass and brushed chrome, caustic light, one tasteful water / serum motion.
-Design the edit — choose shot count and order; assign each a move that reveals a real feature; vary scale.
-Time it across ~10s with editorial rhythm and a held final beat.
-Write the directive prompt per the contract below.
-Output contract
-Output only the directive prompt — nothing else. No "shot logic" line, no headings, no fences, no explanation before or after. It must begin with the words "Create a professional product showcase reel" and read as one clean, paste-ready directive in this shape:
-Create a professional product showcase reel of <product> locked to the reference images so its identity, proportions, label and material stay accurate in every shot. Hard cuts between shots; the product is the hero throughout. Environment: <details>. Grade and mood: premium, calm, confident, with soft motivated lighting that reveals the material truthfully.
-0.0–0.0s — <shot detail>.
-0.0–0.0s — <shot detail>.
-… (2–7 shots, varied in scale and motion) …
-0.0–10.0s — <shot detail>.
-Materials and physics: <how light and matter behave securely>. Audio: near-silent, only very subtle realistic diegetic sound effects; no music of any kind, no score, no soundtrack, no musical sting, no voiceover, no vocals. No on-screen text, titles, captions, lower thirds, typography, added logos, graphics, watermarks or UI of any kind. Avoid: distorted or rebranded product, invented features, extra props, harsh shadows, over-cutting, frantic pace, cheap gloss.
-Guardrails
-Missing input → make the smallest premium assumption and fold it silently into the directive.
-The product is the star; the environment and the edit exist only to serve it.
-Never pad the shot count; fewer, better beats beat seven busy ones.
-Specs (duration, shot ceiling, image count, aspect) are a dated snapshot — defer to any current limits the operator supplies.`;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: [
-          { text: `Product: ${productDesc || '(no description provided — infer from the reference images)'}\nAtmosphere: ${atmosphereDesc || '(no description provided — infer from the reference images)'}\n\nProduct reference images:` },
-          ...productImages.map(img => ({ inlineData: { mimeType: img.mimeType, data: img.data } })),
-          { text: 'Atmosphere reference images:' },
-          ...atmosphereImages.map(img => ({ inlineData: { mimeType: img.mimeType, data: img.data } })),
-        ],
-        config: { systemInstruction: promptWriterSystemInstruction },
-      });
-
-      res.json({ prompt: response.text });
+      const { productDesc, atmosphereDesc }: GenerateBody = req.body;
+      const prompt = await metaChat(
+        `You are a licensed interior architect and design prompt writer. Combine the spatial item description ("${productDesc || ''}") and atmosphere ("${atmosphereDesc || ''}") into a single cohesive architectural photo directive. Output ONLY the styling prompt string.`,
+        { temperature: 0.7 }
+      );
+      res.json({ prompt: prompt.trim() });
     } catch (e: any) {
       console.error('Error generating prompt:', e);
       res.status(500).json({ error: e.message });
     }
   });
 
-  // Quickly auto-describe an uploaded product/atmosphere in the same voice as the
-  // hard-coded examples, so every selection carries a description / style brief.
+  // Describe an uploaded product or room atmosphere using Meta Muse Spark
   app.post('/api/describe', async (req, res) => {
     try {
       const { type, images = [] }: { type?: 'product' | 'atmosphere'; images?: InlineImage[] } = req.body;
@@ -577,211 +901,75 @@ Specs (duration, shot ceiling, image count, aspect) are a dated snapshot — def
         res.status(400).json({ error: 'No images provided' });
         return;
       }
-      const ai = getAiClient();
 
-      const productInstruction = `You write ultra-concise product descriptions for a premium product-film tool.
-Given product reference image(s), output ONE short description (1–2 sentences, plain language): what the product is, plus its key aesthetic and material details. Match the voice of these examples:
-"An oversized cup holder-friendly mug that comes with the last straw you will ever need."
-"Premium luxury running sneakers. Sculptural modular sole and an upper made out of suede nubuck leather and mesh sculptural panels."
-"A bottle of perfume called 'Nerelle'. The ornate bottle features real stone minerals, sodalite, and malachite."
-Output ONLY the description text — no labels, no quotes, no preamble.`;
+      const instruction = type === 'atmosphere'
+        ? 'Describe this scene or room backdrop as a concise architectural style brief (1-2 sentences):'
+        : 'Describe this furniture piece or decor item concisely (1-2 sentences):';
 
-      const atmosphereInstruction = `You write ultra-concise environment "style briefs" for a premium product-film tool.
-Given a reference image of an empty scene or backdrop, output ONE short style brief (1–3 sentences) describing the environment, materials, lighting and mood. Where the product would sit, refer to it as the literal token "the {product_id}" so it can be substituted later. Match the voice of these examples:
-"Minimalist craft luxury. A pristine Carrara marble plinth rests against a soft sage backdrop. Crisp directional sunlight casts soft shadows, creating an earthy yet elevated aesthetic. The {product_id} is seen in perfect detail, conveying texture, calm, and sophisticated gradients."
-"Mediterranean, modern luxury. Warm, porous travertine blocks create a structured geometric podium beneath a brilliant azure sky, presenting the {product_id} perfectly. Soft dappled leaf shadows contrast the sharp architectural lines, evoking a serene, sun-drenched coastal escape."
-"Mediterranean minimalism utilizing a warm sun-drenched, polished plaster corner with a soft rose-tinted floor. Crisp palm frond silhouettes cast dramatic yet serene shadows evoking a premium organic golden-hour mood."
-Output ONLY the style brief text — no labels, no quotes, no preamble.`;
+      const description = await metaChat([
+        { type: 'text', text: instruction },
+        { type: 'image_url', image_url: { url: `data:${images[0].mimeType};base64,${images[0].data}` } }
+      ]);
 
-      const isAtmosphere = type === 'atmosphere';
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: [
-          { text: isAtmosphere ? 'Describe this scene/backdrop as a style brief:' : 'Describe this product:' },
-          ...images.map(img => ({ inlineData: { mimeType: img.mimeType, data: img.data } })),
-        ],
-        config: {
-          systemInstruction: isAtmosphere ? atmosphereInstruction : productInstruction,
-          maxOutputTokens: 512,
-          temperature: 0.7,
-        },
-      });
-
-      res.json({ description: (response.text || '').trim() });
+      res.json({ description: description.trim() });
     } catch (e: any) {
       console.error('Error describing image:', e);
       res.status(500).json({ error: e.message });
     }
   });
 
-  // Endpoint to start omni generation (the cinematic room walkthrough / "3D-feel" tour)
-  app.post('/api/generate-video', async (req, res) => {
-    try {
-      const { prompt, productImages = [], atmosphereImages = [] }: GenerateBody & { prompt?: string } = req.body;
-      const ai = getAiClient();
-
-      console.log(`Sending request to Gemini Omni (${productImages.length} product, ${atmosphereImages.length} atmosphere images)...`);
-
-      const interaction = await ai.interactions.create({
-        model: 'gemini-omni-flash-preview',
-        input: [
-            ...productImages.map(img => ({ type: 'image' as const, data: img.data, mime_type: img.mimeType })),
-            ...atmosphereImages.map(img => ({ type: 'image' as const, data: img.data, mime_type: img.mimeType })),
-            { type: 'text', text: prompt }
-        ],
-        response_format: { type: 'video', delivery: 'uri' },
-        store: true,
-        background: false,
-        stream: false
-      });
-
-      console.log(`Interaction created: ${interaction.id}`);
-
-      if (!interaction.output_video || !interaction.output_video.uri) {
-        throw new Error('No video URI returned from interaction.');
-      }
-
-      const fileIdMatch = interaction.output_video.uri.match(/files\/([a-zA-Z0-9_-]+)/);
-      const fileId = fileIdMatch ? fileIdMatch[1] : null;
-
-      res.json({ interactionId: interaction.id, uri: interaction.output_video.uri, fileId });
-    } catch (e: any) {
-      console.error('Error generating video:', e);
-      res.status(500).json({ error: e?.body || e.message });
-    }
+  // Video tour endpoints
+  app.post('/api/generate-video', (_req, res) => {
+    res.status(501).json({ error: 'Video tour is not available with the Meta API.' });
   });
 
-  // Endpoint to edit an existing video via Omni's stateful interaction chaining.
-  app.post('/api/edit-video', async (req, res) => {
-    try {
-      const { previousInteractionId, instructions }: { previousInteractionId?: string; instructions?: string } = req.body;
-      if (!previousInteractionId || !instructions) {
-        res.status(400).json({ error: 'previousInteractionId and instructions are required' });
-        return;
-      }
-      const ai = getAiClient();
-
-      console.log(`Editing interaction ${previousInteractionId}...`);
-      const interaction = await ai.interactions.create({
-        model: 'gemini-omni-flash-preview',
-        previous_interaction_id: previousInteractionId,
-        input: [{ type: 'text', text: instructions }],
-        response_format: { type: 'video', delivery: 'uri' },
-        store: true,
-        background: false,
-        stream: false
-      });
-
-      if (!interaction.output_video || !interaction.output_video.uri) {
-        throw new Error('No video URI returned from interaction.');
-      }
-
-      const fileIdMatch = interaction.output_video.uri.match(/files\/([a-zA-Z0-9_-]+)/);
-      const fileId = fileIdMatch ? fileIdMatch[1] : null;
-
-      res.json({ interactionId: interaction.id, uri: interaction.output_video.uri, fileId });
-    } catch (e: any) {
-      console.error('Error editing video:', e);
-      res.status(500).json({ error: e?.body || e.message });
-    }
+  app.post('/api/edit-video', (_req, res) => {
+    res.status(501).json({ error: 'Video tour editing is not available with the Meta API.' });
   });
 
-  // Endpoint to poll file status
-  app.get('/api/file-status/:fileId', async (req, res) => {
-    try {
-      const { fileId } = req.params;
-      const ai = getAiClient();
-
-      const fInfo = await ai.files.get({ name: `files/${fileId}` });
-      const state = (fInfo.state as any)?.name || fInfo.state;
-      res.json({ state });
-    } catch (e: any) {
-      console.error('Error getting file status:', e);
-      res.status(500).json({ error: e.message });
-    }
+  app.get('/api/file-status/:fileId', (_req, res) => {
+    res.status(404).json({ error: 'File tracking is not supported on Meta API.' });
   });
 
-  const videoCache = new Map<string, Buffer>();
-
-  app.get('/api/video/:fileId', async (req, res) => {
-    try {
-      const { fileId } = req.params;
-      let buffer = videoCache.get(fileId);
-
-      if (!buffer) {
-        const apiKey = process.env.GEMINI_API_KEY;
-        const url = `https://generativelanguage.googleapis.com/v1beta/files/${fileId}:download?alt=media&key=${apiKey}`;
-        const upstream = await fetch(url);
-        if (!upstream.ok) {
-          return res.status(upstream.status).send(`Failed to fetch video: ${upstream.statusText}`);
-        }
-        buffer = Buffer.from(await upstream.arrayBuffer());
-        if (videoCache.size >= 12) {
-          const oldest = videoCache.keys().next().value;
-          if (oldest) videoCache.delete(oldest);
-        }
-        videoCache.set(fileId, buffer);
-      }
-
-      const total = buffer.length;
-      res.setHeader('Content-Type', 'video/mp4');
-      res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Cache-Control', 'public, max-age=31536000');
-
-      const range = req.headers.range;
-      if (range) {
-        const match = /bytes=(\d*)-(\d*)/.exec(range);
-        let start = match && match[1] ? parseInt(match[1], 10) : 0;
-        let end = match && match[2] ? parseInt(match[2], 10) : total - 1;
-        if (Number.isNaN(start)) start = 0;
-        if (Number.isNaN(end) || end >= total) end = total - 1;
-        if (start > end || start >= total) {
-          res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
-          return;
-        }
-        res.status(206);
-        res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
-        res.setHeader('Content-Length', end - start + 1);
-        res.end(buffer.subarray(start, end + 1));
-      } else {
-        res.setHeader('Content-Length', total);
-        res.end(buffer);
-      }
-    } catch (e: any) {
-      console.error('Error streaming video:', e);
-      res.status(500).send(e.message);
-    }
+  app.get('/api/video/:fileId', (_req, res) => {
+    res.status(404).json({ error: 'Video playback is not supported on Meta API.' });
   });
+
+  const rootPath = process.cwd();
+  const distPath = path.join(rootPath, "dist");
+  const hasDist = fs.existsSync(distPath) && fs.existsSync(path.join(distPath, "index.html"));
+
+  // Serve test-image2.jpeg if requested directly
+  const testImgPath = path.join(rootPath, "test-image2.jpeg");
+  if (fs.existsSync(testImgPath)) {
+    app.get("/test-image2.jpeg", (_req, res) => {
+      res.sendFile(testImgPath);
+    });
+  }
 
   // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
+  if (!hasDist || process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true, hmr: false },
+      server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.use(express.static(distPath, {
+      setHeaders: (res, filePath) => {
+        if (filePath.endsWith(".html")) {
+          res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        }
+      }
+    }));
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-  const server = app.listen(port, host, () => {
-    console.log(`Server running on http://${host === "0.0.0.0" ? "localhost" : host}:${port}`);
-  });
-
-  server.on("error", (err: any) => {
-    console.error("Server listen error:", err);
+  app.listen(port, host, () => {
+    console.log(`Server running on http://${host}:${port} [Meta API Mode with Production Scaling Layer]`);
   });
 }
-
-process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled Rejection:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught Exception:", err);
-});
 
 startServer().catch(console.error);
