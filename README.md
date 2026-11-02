@@ -57,9 +57,6 @@ Cost grows with the number of Meta calls, so every cache hit is a call that isn'
 
 Requires Node.js 18+ and a Meta Model API key. `npm install`, set `META_API_KEY`, then `npm run dev` (script names may differ slightly in `package.json`). Check `/api/meta-health?image=1&edit=1` and `/api/stats` once it's running.
 
-## History
-
-SameRoom grew out of my earlier prototype, Space Lift (https://github.com/Prakhargupta1994/Space-Lift), built on Google Gemini, which supplied the interface and design library. The Meta Model API integration and the production layer above were built during the Meta Global AI Developer Hackathon (Oct 26 – Nov 4, 2026).
 
 ## Roadmap
 SAM 3.1 surface masks for per-surface edits · reference-image consistency across angles · Redis-backed limits and cache · render job queue with workers.
